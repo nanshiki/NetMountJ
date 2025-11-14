@@ -11,6 +11,17 @@ It consist of two components:
 In addition to these core components, the NetMount project includes the supporting utility **`ninstall`**, a configuration-based installer (loader) for the DOS `netmount` client. [More info about the `ninstall`](UTILS.md)
 
 -----
+## Japanese edition (日本語環境対応版)
+
+Japanese filenames are converted to Shift JIS on the server side, enabling display and read/write operations for Japanese filenames on PC-9801/PC-9821 and DOS/V.
+PC-9801/PC-9821 timer-compatible client version has also been created.
+Please note that building from this source will only generate the Shift JIS server version and the PC-9801/PC-9821 client version.
+
+日本語のファイル名をサーバー側でShift JISに変換するので、PC-9801/PC-9821やDOS/Vで日本語ファイル名の表示や読み書きが可能となります。
+クライアントのPC-9801/PC-9821タイマー対応版も作成しています。
+ここのソースでビルドするとサーバーはShift JIS対応版、クライアントはPC-9801/PC9821対応版のみ生成されますのでご注意ください。
+
+-----
 ## `netmount` (DOS Client)
 
 - A TSR driver for DOS that allows mounting shared directories from one or more remote machines as local drives.
