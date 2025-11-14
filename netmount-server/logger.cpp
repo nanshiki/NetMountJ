@@ -2,6 +2,9 @@
 // Copyright 2025 Jaroslav Rohel, jaroslav.rohel@gmail.com
 
 #include "logger.hpp"
+#if defined(SHIFT_JIS) && defined(_WIN32)
+#include "unicode_to_ascii.hpp"
+#endif
 
 #include <array>
 #include <chrono>
@@ -20,7 +23,11 @@ void log(LogLevel level, const std::string & message) {
         "{:%FT%TZ} {} {}",
         std::chrono::time_point_cast<std::chrono::milliseconds>(now),
         LOG_LEVEL_C_STR[static_cast<int>(level)],
+#if defined(SHIFT_JIS) && defined(_WIN32)
+        utf8_to_sjis(message));
+#else
         message);
+#endif
     std::fputs(formatted_message.c_str(), stderr);
 }
 

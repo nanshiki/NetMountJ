@@ -764,8 +764,14 @@ void Drive::Item::update_last_used_timestamp() { last_used_time = time(NULL); }
 fcb_file_name short_name_to_fcb(const std::string & short_name) noexcept {
     fcb_file_name fcb_name;
     unsigned int i = 0;
+#ifdef SHIFT_JIS
+    auto sjis_name = utf8_to_sjis(short_name);
+    auto it = sjis_name.begin();
+    const auto it_end = sjis_name.end();
+#else
     auto it = short_name.begin();
     const auto it_end = short_name.end();
+#endif
     while (it != it_end && *it == '.') {
         fcb_name.name_blank_padded[i++] = '.';
         ++it;
@@ -773,8 +779,21 @@ fcb_file_name short_name_to_fcb(const std::string & short_name) noexcept {
             break;
         }
     }
+#ifdef SHIFT_JIS
+    bool flag = false;
+#endif
     while (it != it_end && *it != '.') {
+#ifdef SHIFT_JIS
+        if(!flag) {
+            fcb_name.name_blank_padded[i++] = ascii_to_upper(*it);
+            flag = iskanji(static_cast<unsigned char>(*it));
+        } else {
+            fcb_name.name_blank_padded[i++] = *it;
+            flag = false;
+        }
+#else
         fcb_name.name_blank_padded[i++] = ascii_to_upper(*it);
+#endif
         ++it;
         if (i == sizeof(fcb_name.name_blank_padded)) {
             break;
@@ -794,9 +813,22 @@ fcb_file_name short_name_to_fcb(const std::string & short_name) noexcept {
         ++it;
     }
 
+#ifdef SHIFT_JIS
+    flag = false;
+#endif
     i = 0;
     for (; it != it_end && *it != '.'; ++it) {
-        fcb_name.ext_blank_padded[i++] = ascii_to_upper(*it);
+#ifdef SHIFT_JIS
+        if(!flag) {
+            fcb_name.ext_blank_padded[i++] = ascii_to_upper(*it);
+            flag = iskanji(static_cast<unsigned char>(*it));
+        } else {
+            fcb_name.name_blank_padded[i++] = *it;
+            flag = false;
+        }
+#else
+        fcb_name.name_blank_padded[i++] = ascii_to_upper(*it);
+#endif
         if (i == sizeof(fcb_name.ext_blank_padded)) {
             break;
         }
@@ -817,14 +849,41 @@ std::pair<unsigned int, bool> sanitize_short_name(std::string_view in, char * ou
     static const std::set<char> allowed_special = {
         '!', '#', '$', '%', '&', '\'', '(', ')', '-', '@', '^', '_', '`', '{', '}', '~'};
 
+#ifdef SHIFT_JIS
+    bool flag = false;
+#else
     const std::size_t last_non_space_idx = in.find_last_not_of(' ');
-
+#endif
     unsigned int out_len = 0;
     for (std::size_t idx = 0; idx < in.length(); ++idx) {
         const char ch = in[idx];
         if (out_len == buf_size) {
+#ifdef SHIFT_JIS
+            if(iskanji(static_cast<unsigned char>(out_buf[out_len - 1]))) {
+                out_buf[out_len - 1] = ' ';
+            }
+#endif
             return {out_len, true};
         }
+#ifdef SHIFT_JIS
+        if(!flag) {
+            if(iskanji(static_cast<unsigned char>(ch))) {
+                out_buf[out_len++] = ch;
+                flag = true;
+                continue;
+            } else if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || allowed_special.contains(ch)) {
+                out_buf[out_len++] = ch;
+                continue;
+            } else if (ch >= 'a' && ch <= 'z') {
+                out_buf[out_len++] = ch - 'a' + 'A';
+                continue;
+            }
+        } else if(flag) {
+            out_buf[out_len++] = ch;
+            flag = false;
+            continue;
+        }
+#else
         if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || allowed_special.contains(ch)) {
             out_buf[out_len++] = ch;
             continue;
@@ -840,7 +899,7 @@ std::pair<unsigned int, bool> sanitize_short_name(std::string_view in, char * ou
             out_buf[out_len++] = ch;
             continue;
         }
-
+#endif
         // Replace disallowed characters with '_'
         out_buf[out_len++] = '_';
     }
@@ -849,7 +908,6 @@ std::pair<unsigned int, bool> sanitize_short_name(std::string_view in, char * ou
     while (out_len < buf_size) {
         out_buf[--buf_size] = ' ';
     }
-
     return {out_len, false};
 }
 
@@ -886,6 +944,11 @@ bool file_name_to_83(
         const unsigned int counter_len = counter > 999 ? 4 : (counter > 99 ? 3 : (counter > 9 ? 2 : 1));
         if (base_len + counter_len > sizeof(fcb_name.name_blank_padded) - 1) {
             base_len = sizeof(fcb_name.name_blank_padded) - 1 - counter_len;
+#ifdef SHIFT_JIS
+            if(iskanji_position(fcb_name.name_blank_padded, base_len)) {
+                base_len--;
+            }
+#endif
         }
 
         name_blank_padded[base_len] = '~';

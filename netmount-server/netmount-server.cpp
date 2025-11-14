@@ -24,7 +24,11 @@
 #include <string>
 #include <string_view>
 
+#ifdef SHIFT_JIS
+#define PROGRAM_VERSION "1.6.0J"
+#else
 #define PROGRAM_VERSION "1.6.0"
+#endif
 
 // structs are packed
 #pragma pack(1)
@@ -132,6 +136,9 @@ std::filesystem::path create_relative_path(const void * buff, uint16_t len) {
     auto * ptr = reinterpret_cast<const char *>(buff);
 
     std::string search_template(ptr, len);
+#ifdef SHIFT_JIS
+    search_template = sjis_to_utf8(search_template);
+#endif
     std::transform(search_template.begin(), search_template.end(), search_template.begin(), ascii_to_lower);
     std::replace(search_template.begin(), search_template.end(), '\\', '/');
     return std::filesystem::path(search_template).relative_path();
@@ -246,7 +253,7 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
                 drive.change_dir(relative_path);
             } catch (const std::runtime_error & ex) {
                 log(LogLevel::WARNING,
-                    "REMOVE_DIR \"{:c}:\\{}\": {}\n",
+                    "CHANGE_DIR \"{:c}:\\{}\": {}\n",
                     reqdrv + 'A',
                     relative_path.string(),
                     ex.what());
@@ -1277,7 +1284,9 @@ int main(int argc, char ** argv) {
 
     if (is_file_name_conversion_active && !transliteration_map_path.empty()) {
         try {
+#ifndef SHIFT_JIS
             load_transliteration_map(transliteration_map_path);
+#endif
         } catch (const std::exception & ex) {
             log(LogLevel::CRITICAL,
                 "Filename conversion is enabled, but the transliteration map failed to load: {}\n",

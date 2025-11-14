@@ -13,6 +13,7 @@
 #include <system_error>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -63,6 +64,7 @@ std::pair<std::uint32_t, bool> utf8_to_codepoint(std::string_view utf8_char) {
 }
 
 
+#ifndef SHIFT_JIS
 bool is_combining_mark(std::uint32_t cp) {
     // This covers the most-used combining ranges.
     return (cp >= 0x0300 && cp <= 0x036F) ||  // Combining Diacritical Marks
@@ -71,6 +73,7 @@ bool is_combining_mark(std::uint32_t cp) {
            (cp >= 0x20D0 && cp <= 0x20FF) ||  // Combining Diacritical Marks for Symbols
            (cp >= 0xFE20 && cp <= 0xFE2F);    // Combining Half Marks
 }
+#endif
 
 }  // namespace
 
@@ -123,9 +126,14 @@ void load_transliteration_map(const std::filesystem::path & filename) {
     }
 }
 
+#ifndef _WIN32
+#include <iconv.h>
 
 // Convert UTF-8 string to ASCII
 std::string convert_utf8_to_ascii(const std::string & input) {
+#ifdef SHIFT_JIS
+    return utf8_to_sjis(input);
+#else
     std::string result;
 
     for (size_t i = 0; i < input.size();) {
@@ -166,13 +174,22 @@ std::string convert_utf8_to_ascii(const std::string & input) {
     }
 
     return result;
+#endif
 }
 
+#else
+#include <Windows.h>
 
 // Convert Windows UTF-16 string to ASCII
 std::string convert_windows_unicode_to_ascii(const std::wstring & input) {
     std::string result;
-
+#ifdef SHIFT_JIS
+    int len = WideCharToMultiByte(CP_ACP, 0, input.c_str(), -1, NULL, 0, NULL, NULL);
+    std::vector<char> dst(len + 1);
+    WideCharToMultiByte(CP_ACP, 0, input.c_str(), -1, dst.data(), len, NULL, NULL);
+    dst[len] = 0;
+    result = dst.data();
+#else
     for (size_t i = 0; i < input.size();) {
         const wchar_t wc = input[i];
 
@@ -207,6 +224,100 @@ std::string convert_windows_unicode_to_ascii(const std::wstring & input) {
         }
         ++i;
     }
-
+#endif
     return result;
 }
+#endif
+
+#ifdef SHIFT_JIS
+std::string sjis_to_utf8(const std::string src)
+{
+    std::string result;
+#ifdef _WIN32
+    int len = MultiByteToWideChar(CP_ACP, 0, src.c_str(), -1, NULL, 0);
+    std::vector<WCHAR> wdst(len + 1);
+    MultiByteToWideChar(CP_ACP, 0, src.c_str(), -1, wdst.data(), len);
+    wdst[len] = 0;
+    len = WideCharToMultiByte(CP_UTF8, 0, wdst.data(), -1, NULL, 0, NULL, NULL);
+    std::vector<char> dst(len + 1);
+    WideCharToMultiByte(CP_UTF8, 0, wdst.data(), -1, dst.data(), len, NULL, NULL);
+    dst[len] = 0;
+    result = dst.data();
+#else
+    iconv_t ic;
+
+    if((ic = iconv_open("UTF-8", "CP932")) != (iconv_t)-1) {
+        char *src_pt, *dst_pt;
+        size_t src_length = src.length();
+        size_t dst_length = src_length * 4;
+        std::vector<char> dst(dst_length + 1);
+        src_pt = const_cast<char *>(src.c_str());
+        dst_pt = dst.data();
+        iconv(ic, &src_pt, &src_length, &dst_pt, &dst_length);
+        *dst_pt = 0;
+        result = dst.data();
+        iconv_close(ic);
+    }
+#endif
+    return result;
+}
+
+std::string utf8_to_sjis(const std::string src)
+{
+    std::string result;
+#ifdef _WIN32
+    int len = MultiByteToWideChar(CP_UTF8, 0, src.c_str(), -1, NULL, 0);
+    std::vector<WCHAR> wdst(len + 1);
+    MultiByteToWideChar(CP_UTF8, 0, src.c_str(), -1, wdst.data(), len);
+    wdst[len] = 0;
+    len = WideCharToMultiByte(CP_ACP, 0, wdst.data(), -1, NULL, 0, NULL, NULL);
+    std::vector<char> dst(len + 1);
+    WideCharToMultiByte(CP_ACP, 0, wdst.data(), -1, dst.data(), len, NULL, NULL);
+    dst[len] = 0;
+    result = dst.data();
+#else
+    iconv_t ic;
+
+    if((ic = iconv_open("CP932", "UTF-8")) != (iconv_t)-1) {
+        char *src_pt, *dst_pt;
+        size_t src_length = src.length();
+        size_t dst_length = src_length * 4;
+        std::vector<char> dst(dst_length + 1);
+        src_pt = const_cast<char *>(src.c_str());
+        dst_pt = dst.data();
+        iconv(ic, &src_pt, &src_length, &dst_pt, &dst_length);
+        *dst_pt = 0;
+        result = dst.data();
+        iconv_close(ic);
+    }
+#endif
+    return result;
+}
+
+bool iskanji(unsigned char ch)
+{
+    if(((ch >= 0x81) && (ch <= 0x9f)) || ((ch >= 0xe0) && (ch <= 0xfc))) {
+        return true;
+    }
+    return false;
+}
+
+bool iskanji_position(unsigned char *buffer, int pos)
+{
+    bool flag = false;
+    while(pos > 0) {
+        if(!flag) {
+            if(iskanji(*buffer)) {
+                flag = true;
+            }
+        } else {
+            flag = false;
+        }
+        buffer++;
+        pos--;
+    }
+    return flag;
+}
+
+#endif
+
