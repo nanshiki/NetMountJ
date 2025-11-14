@@ -12,6 +12,16 @@
 
 #pragma pack(1)
 
+#ifdef PC98
+#define TICK_ADDRESS    0x4F1
+#define TICK_HZ10       320
+#define TICK_HZ         32
+#else
+#define TICK_ADDRESS    0x46C
+#define TICK_HZ10       182
+#define TICK_HZ         18
+#endif
+
 #define PROGRAM_VERSION "1.6.0"
 
 
@@ -147,7 +157,9 @@ CS_VARIABLE(global_sda_ptr, struct dos_sda __far *, 4)     // ptr to DOS SDA (se
 CS_VARIABLE(shared_data, struct shared_data, SHARED_DATA_SIZE)  // shared between NetMount processes
 CS_VARIABLE(
     read_file_buffer, struct file_buffer, FILE_BUFFER_STRUCT_SIZE)  // buffer for last readed file data from server
-
+#ifdef PC98
+CS_VARIABLE(global_timer98_flag, int8_t, 1)
+#endif
 
 #define swap_word(value) (uint16_t)((uint16_t)value << 8 | (uint16_t)value >> 8)
 
@@ -632,6 +644,33 @@ static void __declspec(naked) pktdrv_recv(void) {
     // clang-format on
 }
 
+#ifdef PC98
+static void __declspec(naked) timer98_func()
+{
+    __asm {
+        mov byte ptr cs:global_timer98_flag, 1
+        iret
+    }
+}
+
+// Call timer_func() after count*10ms has elapsed.
+void start_timer98(uint16_t count)
+{
+    __asm {
+        push es
+
+        push cs
+        pop es
+        mov ah,0x02
+        mov bx,offset timer98_func
+        mov cx,count
+        int 0x1c
+        mov byte ptr cs:global_timer98_flag, 0
+
+        pop es
+    }
+}
+#endif
 
 // Sends an ARP request and waits until the destination HW address is known or time expires.
 // If the destination HW address is still not known, sends the ARP request again and again
@@ -660,7 +699,7 @@ static void send_arp_request(uint8_t local_drive) {
 
     // Lowest 16 bits of timer. The default frequency is 18.2 Hz.
     // Warning: this location won't increment while interrupts are disabled!
-    volatile uint16_t __far * const time = (uint16_t __far *)0x46C;
+    volatile uint16_t __far * const time = (uint16_t __far *)TICK_ADDRESS;
 
     // It sends an ARP request and waits until the destination HW address is known or time expires.
     // If the destination HW address is still not known, sends the ARP request again and again
@@ -668,11 +707,17 @@ static void send_arp_request(uint8_t local_drive) {
     for (int retries = 0; retries <= ARP_REQUEST_MAX_RETRIES; ++retries) {
         const uint16_t length = sizeof(struct mac_hdr) + sizeof(struct arp_hdr);
         send_frame(length, frame);
-
+#ifdef PC98
+        start_timer98(ARP_REQUEST_RCV_TMO_SEC * 100);
+#endif
         // Wait until the destination HW address is known (different from the "broadcast" address).
         const uint16_t wait_start_time = *time;
-        const uint16_t timeout_ticks = (ARP_REQUEST_RCV_TMO_SEC * 182) / 10;
+        const uint16_t timeout_ticks = (ARP_REQUEST_RCV_TMO_SEC * TICK_HZ10) / 10;
+#ifdef PC98
+        while (*time - wait_start_time <= timeout_ticks && !*getptr_global_timer98_flag()) {
+#else
         while (*time - wait_start_time <= timeout_ticks) {
+#endif
             // Check that the destination HW address is known. If yes, we are done.
             for (int i = 0; i < sizeof(struct mac_addr); ++i) {
                 if (ip_to_mac_map->mac_addr.bytes[i] != 0xFF) {
@@ -770,7 +815,7 @@ static uint16_t send_request(
     const uint8_t max_request_retries = drv_info->max_request_retries;
 
     // lowest 16 bits of timer. Warning: this location won't increment while interrupts are disabled!
-    volatile uint16_t __far * const time = (uint16_t __far *)0x46C;
+    volatile uint16_t __far * const time = (uint16_t __far *)TICK_ADDRESS;
 
     // Send the request and wait for a response for the minimum configured timeout.
     // If no response is received, send the request again and again, up to configured maximum.
@@ -780,10 +825,17 @@ static uint16_t send_request(
         send_frame(frame_length, frame);
 
         // wait for (and validate) the answer frame
+#ifdef PC98
+        start_timer98(rcv_tmo_18_2_ticks / TICK_HZ * 100);
+#endif
         const struct drive_proto_hdr * const rcv_drive_proto =
             (struct drive_proto_hdr *)((struct ether_frame *)global_recv_buff)->udp_data;
         for (const uint16_t rcv_start_time = *time;;) {
+#ifdef PC98
+            if (*time - rcv_start_time > rcv_tmo_18_2_ticks || *getptr_global_timer98_flag()) {
+#else
             if (*time - rcv_start_time > rcv_tmo_18_2_ticks) {
+#endif
                 // timeout, extend the timeout *2, but do not exceed the configured maximum
                 rcv_tmo_18_2_ticks <<= 1;
                 if (rcv_tmo_18_2_ticks > max_rcv_tmo_18_2_ticks) {
@@ -880,10 +932,10 @@ static void handle_request_for_our_drive(void) {
     volatile int16_t * const recvbufflen_ptr = getptr_global_recv_data_len();
 
     // Timer. The default frequency is 18.2 Hz.
-    volatile uint32_t __far * const time = (uint32_t __far *)0x46C;
+    volatile uint32_t __far * const time = (uint32_t __far *)TICK_ADDRESS;
 
     struct file_buffer * const read_buffer = getptr_read_file_buffer();
-    if (read_buffer->valid_bytes > 0 && *time - read_buffer->timestamp > 5 * 18) {
+    if (read_buffer->valid_bytes > 0 && *time - read_buffer->timestamp > 5 * TICK_HZ) {
         // Keep file_buffer data valid for no more than 5 seconds.
         read_buffer->valid_bytes = 0;
     }
@@ -2350,6 +2402,9 @@ static void print_help(void) {
     my_print_dos_string(
         "NetMount " PROGRAM_VERSION
         ", Copyright 2024-2025 Jaroslav Rohel <jaroslav.rohel@gmail.com>\r\n"
+#ifdef PC98
+        "         for PC-9801/PC-9821\r\n"
+#endif
         "NetMount comes with ABSOLUTELY NO WARRANTY. This is free software\r\n"
         "and you are welcome to redistribute it under the terms of the GNU GPL v2.\r\n"
         "\r\n"
@@ -2858,8 +2913,8 @@ int main(int argc, char * argv[]) {
         shared_data_ptr->ldrv[drive_no] = remote_drive_no;
 
         // Convert timeouts to 18.2 Hz ticks (2 least significant bits ignored). Uses only integer operations.
-        drv_info->min_rcv_tmo_18_2_ticks_shr_2 = ((min_rcv_tmo_sec * 182) / 10) >> 2;
-        drv_info->max_rcv_tmo_18_2_ticks_shr_2 = ((max_rcv_tmo_sec * 182) / 10) >> 2;
+        drv_info->min_rcv_tmo_18_2_ticks_shr_2 = ((min_rcv_tmo_sec * TICK_HZ10) / 10) >> 2;
+        drv_info->max_rcv_tmo_18_2_ticks_shr_2 = ((max_rcv_tmo_sec * TICK_HZ10) / 10) >> 2;
 
         drv_info->max_request_retries = max_request_retries;
 
