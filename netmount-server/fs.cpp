@@ -871,7 +871,7 @@ std::pair<unsigned int, bool> sanitize_short_name(std::string_view in, char * ou
                 out_buf[out_len++] = ch;
                 flag = true;
                 continue;
-            } else if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || allowed_special.contains(ch)) {
+            } else if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || allowed_special.contains(ch) || ishalfkana(static_cast<unsigned char>(ch))) {
                 out_buf[out_len++] = ch;
                 continue;
             } else if (ch >= 'a' && ch <= 'z') {

@@ -234,9 +234,9 @@ std::string sjis_to_utf8(const std::string src)
 {
     std::string result;
 #ifdef _WIN32
-    int len = MultiByteToWideChar(CP_ACP, 0, src.c_str(), -1, NULL, 0);
+    int len = MultiByteToWideChar(CP_OEMCP, 0, src.c_str(), -1, NULL, 0);
     std::vector<WCHAR> wdst(len + 1);
-    MultiByteToWideChar(CP_ACP, 0, src.c_str(), -1, wdst.data(), len);
+    MultiByteToWideChar(CP_OEMCP, 0, src.c_str(), -1, wdst.data(), len);
     wdst[len] = 0;
     len = WideCharToMultiByte(CP_UTF8, 0, wdst.data(), -1, NULL, 0, NULL, NULL);
     std::vector<char> dst(len + 1);
@@ -270,9 +270,9 @@ std::string utf8_to_sjis(const std::string src)
     std::vector<WCHAR> wdst(len + 1);
     MultiByteToWideChar(CP_UTF8, 0, src.c_str(), -1, wdst.data(), len);
     wdst[len] = 0;
-    len = WideCharToMultiByte(CP_ACP, 0, wdst.data(), -1, NULL, 0, NULL, NULL);
+    len = WideCharToMultiByte(CP_OEMCP, 0, wdst.data(), -1, NULL, 0, NULL, NULL);
     std::vector<char> dst(len + 1);
-    WideCharToMultiByte(CP_ACP, 0, wdst.data(), -1, dst.data(), len, NULL, NULL);
+    WideCharToMultiByte(CP_OEMCP, 0, wdst.data(), -1, dst.data(), len, NULL, NULL);
     dst[len] = 0;
     result = dst.data();
 #else
@@ -317,6 +317,14 @@ bool iskanji_position(unsigned char *buffer, int pos)
         pos--;
     }
     return flag;
+}
+
+bool ishalfkana(unsigned char ch)
+{
+    if(ch >= 0xa1 && ch <= 0xdf) {
+        return true;
+    }
+    return false;
 }
 
 #endif

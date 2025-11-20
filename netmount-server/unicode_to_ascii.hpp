@@ -20,6 +20,7 @@ std::string convert_windows_unicode_to_ascii(const std::wstring & input);
 #ifdef SHIFT_JIS
 std::string sjis_to_utf8(const std::string src);
 std::string utf8_to_sjis(const std::string src);
+bool ishalfkana(unsigned char ch);
 bool iskanji(unsigned char ch);
 bool iskanji_position(unsigned char *buffer, int pos);
 #endif

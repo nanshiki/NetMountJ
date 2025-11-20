@@ -25,7 +25,7 @@
 #include <string_view>
 
 #ifdef SHIFT_JIS
-#define PROGRAM_VERSION "1.6.0J"
+#define PROGRAM_VERSION "1.6.0J2"
 #else
 #define PROGRAM_VERSION "1.6.0"
 #endif
