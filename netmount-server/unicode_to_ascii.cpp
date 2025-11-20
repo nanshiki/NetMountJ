@@ -184,9 +184,9 @@ std::string convert_utf8_to_ascii(const std::string & input) {
 std::string convert_windows_unicode_to_ascii(const std::wstring & input) {
     std::string result;
 #ifdef SHIFT_JIS
-    int len = WideCharToMultiByte(CP_ACP, 0, input.c_str(), -1, NULL, 0, NULL, NULL);
+    int len = WideCharToMultiByte(CP_OEMCP, 0, input.c_str(), -1, NULL, 0, NULL, NULL);
     std::vector<char> dst(len + 1);
-    WideCharToMultiByte(CP_ACP, 0, input.c_str(), -1, dst.data(), len, NULL, NULL);
+    WideCharToMultiByte(CP_OEMCP, 0, input.c_str(), -1, dst.data(), len, NULL, NULL);
     dst[len] = 0;
     result = dst.data();
 #else
