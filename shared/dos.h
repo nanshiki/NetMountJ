@@ -138,9 +138,11 @@ struct dos_current_dir {
         } net;
     };
     uint16_t backslash_offset;  // offset in current_path of first '\' (always 2, unless it's a SUBST drive)
+#ifndef DOS3
     uint8_t reserved;           //unknown
     far_pointer(void) ifs;      // points to IFS (Installable File System) driver
     uint16_t reserved2;         // unknown
+#endif
 };
 
 
@@ -180,11 +182,19 @@ struct dos_search {
 struct dos_sda {
     uint8_t f0[12];
     far_pointer(unsigned char) curr_dta;
+#ifdef DOS3
+    uint8_t f1[30];
+#else
     uint8_t f1[32];
+#endif
     uint8_t dd;
     uint8_t mm;
     uint16_t yy_1980;
+#ifdef DOS3
+    uint8_t f2[96];
+#else
     uint8_t f2[106];
+#endif
     unsigned char fn1[128];
     unsigned char fn2[128];
     struct dos_search sdb;
@@ -196,16 +206,24 @@ struct dos_sda {
     uint8_t f4[11];
     unsigned char srch_attr;
     unsigned char open_mode;
+#ifdef DOS3
+    uint8_t f5[48];
+#else
     uint8_t f5[51];
+#endif
     far_pointer(unsigned char) drive_cdsptr;
     uint8_t f6[12];
     unsigned short fn1_csofs;
     unsigned short fn2_csofs;
+#ifdef DOS3
+    uint8_t f7[56];
+#else
     uint8_t f7[71];
     unsigned short action_ext;
     unsigned short attr_ext;
     unsigned short mode_ext;
     uint8_t f8[29];
+#endif
     struct dos_search ren_srcfile;
     struct dos_directory_entry ren_file;
 };

@@ -1443,11 +1443,13 @@ static void handle_request_for_our_drive(void) {
 
             struct drive_proto_open_create * const args = (struct drive_proto_open_create * const)buff;
             args->attrs = *(*getptr_global_orig_stack_ptr() + sizeof(*r) / 2);
+#ifndef DOS3
+            // Extended open create file is DOS 4+
             if (subfunction == INT2F_EXTENDED_OPEN_CREATE_FILE) {
                 args->action = sda_ptr->action_ext;
                 args->mode = sda_ptr->mode_ext;
             }
-
+#endif
             i = send_request(subfunction, reqdrv, len + 6, &reply, &ax);
             if (i == NETWORK_ERROR) {
                 set_error(r, 2);
@@ -1820,7 +1822,11 @@ static void __declspec(naked) int2F_redirector(void) {
     from_sdb_drive_no:
         push es
         les bx, dword ptr cs:global_sda_ptr
+#ifdef DOS3
+        mov bl, byte ptr [es:bx + 402]  // global_sda_ptr->sdb.drive_no
+#else
         mov bl, byte ptr [es:bx + 414]  // global_sda_ptr->sdb.drive_no
+#endif
         pop es
         and bl, 0x1F
         jmp validate_drive_no
@@ -1828,7 +1834,11 @@ static void __declspec(naked) int2F_redirector(void) {
     from_sdaptr:
         push es
         les bx, dword ptr cs:global_sda_ptr
+#ifdef DOS3
+        mov bl, byte ptr [es:bx + 146]  // global_sda_ptr->fn1[0]
+#else
         mov bl, byte ptr [es:bx + 158]  // global_sda_ptr->fn1[0]
+#endif
         pop es
         call drive_to_num
 
@@ -2403,7 +2413,11 @@ static void print_help(void) {
         "NetMount " PROGRAM_VERSION
         ", Copyright 2024-2025 Jaroslav Rohel <jaroslav.rohel@gmail.com>\r\n"
 #ifdef PC98
-        "         for PC-9801/PC-9821\r\n"
+ #ifdef DOS3
+        "         for PC-9801 MS-DOS 3.1/3.3\r\n"
+ #else
+        "         for PC-9801/PC-9821 MS-DOS 5.0/6.2\r\n"
+ #endif
 #endif
         "NetMount comes with ABSOLUTELY NO WARRANTY. This is free software\r\n"
         "and you are welcome to redistribute it under the terms of the GNU GPL v2.\r\n"
@@ -2460,17 +2474,25 @@ int main(int argc, char * argv[]) {
             return EXIT_OK;
         }
     }
-
     struct dos_version dos_ver = get_dos_version();
+#ifdef DOS3
+    if (dos_ver.major != 3) {
+#else
     if (dos_ver.major < 5) {
+#endif
+        int major = dos_ver.major + 0x30;
+        int minor = ((dos_ver.minor >= 10) ? dos_ver.minor / 10 : dos_ver.minor) + 0x30;
         my_print_dos_string("Unsupported DOS version $");
-        my_print_char(dos_ver.major + '0');
+        my_print_char(major);
         my_print_char('.');
-        my_print_char(dos_ver.minor + '0');
+        my_print_char(minor);
+#ifdef DOS3
+        my_print_dos_string(". Required 3.1/3.3\r\n$");
+#else
         my_print_dos_string(". Required 5.0+\r\n$");
+#endif
         return EXIT_UNSUPPORTED_DOS;
     }
-
     if (argc < 2) {
         my_print_dos_string("Missing command. Use \"/?\" to display help.\r\n$");
         return EXIT_UNKNOWN_CMD;
