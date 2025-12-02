@@ -3,14 +3,13 @@
 
 #include "../shared/dos.h"
 #include "../shared/drvproto.h"
-#include "exitcode.h"
+#include "../shared/exitcode.h"
+#include "../shared/nettypes.h"
+#include "../shared/pktdrv.h"
+#include "../shared/shdata.h"
 #include "i86.h"
-#include "nettypes.h"
-#include "pktdrv.h"
 
 #include <stdint.h>
-
-#pragma pack(1)
 
 #ifdef PC98
 #define TICK_ADDRESS    0x4F1
@@ -22,26 +21,15 @@
 #define TICK_HZ         18
 #endif
 
-#define PROGRAM_VERSION "1.6.0"
+#define NETMOUNT_VERSION "1.7.0"
 
 
-#define CHECKSUM_IP_HEADER      0x01
-#define CHECKSUM_NETMOUNT_PROTO 0x02
+#pragma pack(1)
 
-// Program parameters
-#define ENABLE_DRIVE_PROTO_CHECKSUM     1
-#define DEFAULT_MIN_RCV_TMO_SECONDS     1
-#define DEFAULT_MAX_RCV_TMO_SECONDS     5
-#define DEFAULT_MAX_NUM_REQUEST_RETRIES 4
-#define DEFAULT_ENABLED_CHECKSUMS       (CHECKSUM_IP_HEADER | CHECKSUM_NETMOUNT_PROTO)
-#define FILE_BUFFER_SIZE                64  // power of two, maximum 128
-
-#define MAX_INTERFACE_MTU 1500
+#define FILE_BUFFER_SIZE MAX_MIN_READ_LEN  // power of two, maximum 128
 
 // 14 = sizeof(mac_hdr); 4 = FCS (validated by hardware/driver, usually not passed to user, but just in case)
-#define MAX_FRAMESIZE 14 + MAX_INTERFACE_MTU + 4
-
-#define DEFAULT_INTERFACE_MTU 1500
+#define MAX_FRAMESIZE 14 + MAX_MTU + 4
 
 #define ARP_REQUEST_RCV_TMO_SEC 1
 #define ARP_REQUEST_MAX_RETRIES 4
@@ -56,62 +44,12 @@
 
 #define NULL ((void *)0)
 
-#define offsetof(__typ, __id) ((uint16_t)((char *)&(((__typ *)0)->__id) - (char *)0))
-
 // make a __far pointer from segment and offset
 #define MK_FP(__s, __o) (((unsigned short)(__s)):>((void __near *)(__o)))
 
 #define DRIVE_DATA_OFFSET (offsetof(struct ether_frame, udp_data) + sizeof(struct drive_proto_hdr))
 
 #define NETWORK_ERROR 0xFFFFU
-
-typedef void(__interrupt * interrupt_handler)(void);
-
-#define MAX_DRIVES_COUNT 26
-struct shared_data {
-    uint8_t ldrv[MAX_DRIVES_COUNT];  // local to remote drives mappings (0=A, 1=B, 2=C, ...);
-                                     // must be first in structure, used in assembler
-    struct drive_info {
-        uint8_t remote_ip_idx;  // index of server ip address in ip_mac_map table
-        uint16_t remote_port;
-        uint8_t min_rcv_tmo_18_2_ticks_shr_2;  // Minimum response timeout ((sec * 18.2) >> 2, clock 18.2 Hz)
-        uint8_t max_rcv_tmo_18_2_ticks_shr_2;  // Maximum response timeout ((sec * 18.2) >> 2, clock 18.2 Hz)
-        uint8_t max_request_retries;           // Maximum number of request retries
-        uint8_t enabled_checksums;
-        uint8_t min_server_read_len;  // Minimum length of data block read from the server
-    } drives[MAX_DRIVES_COUNT];
-    union ipv4_addr local_ipv4;
-    union ipv4_addr net_mask;
-    uint16_t local_port;
-    int8_t disable_sending_arp_request;  // A non-zero value disables sending ARP requests, replying is still allowed.
-    uint8_t gateway_ip_slot;             // index of gateway ip address in ip_mac_map table
-    uint16_t interface_mtu;
-    struct ip_mac_map {
-        union ipv4_addr ip;
-        struct mac_addr mac_addr;
-    } ip_mac_map[4];
-    uint8_t requested_pktdrv_int;  // requested packet driver interrupt handle number (0 - autodetect)
-
-    uint8_t used_pktdrv_int;  // used/found packet driver interrupt handle number
-    uint16_t arp_pkthandle;
-    uint16_t ipv4_pkthandle;
-    struct mac_addr local_mac_addr;
-
-    // Last used remote address. Waiting for a response from it.
-    union ipv4_addr last_remote_ip;
-    uint16_t last_remote_udp_port;
-    volatile uint8_t server_response_received;  // 1 - if response in global_recv_buff
-
-    // Used only for uninstall
-    uint16_t psp_segment;
-    void * int2F_redirector_offset;
-    interrupt_handler orig_INT2F_handler;
-    interrupt_handler pktdrv_INT_handler;
-};
-
-#define SHARED_DATA_SIZE 319  // It is sizeof(struct shared_data). Must be adjusted if structure size is changed!
-// something like static_assert, error during compilation if SHARED_DATA_SIZE != sizeof(struct shared_data)
-typedef char st_assert_SHARED_DATA_SIZE[SHARED_DATA_SIZE == sizeof(struct shared_data) ? 1 : -1];
 
 struct file_buffer {
     uint32_t timestamp;
@@ -762,7 +700,7 @@ static uint16_t send_request(
     }
 
     // resolve remote drive - no need to validate it, it has been validated already by inthandler()
-    const uint8_t drive = getptr_shared_data()->ldrv[local_drive];
+    const uint8_t drive = getptr_shared_data()->drive_map[local_drive];
 
     struct ether_frame * const frame = getptr_global_send_buff();
 
@@ -1848,7 +1786,7 @@ static void __declspec(naked) int2F_redirector(void) {
         jge invalid_drive_no
         push bx
         xor bh, bh
-        lea bx, [shared_data + bx]
+        lea bx, [shared_data + DRIVE_MAP_OFFSET + bx]
         cmp byte ptr [cs:bx], 0xFF
         pop bx
         je invalid_drive_no
@@ -1996,6 +1934,58 @@ static union ipv4_addr parse_ipv4_addr(const char * restrict str, int * error, c
         *endptr = local_endptr;
     }
     return addr;
+}
+
+
+static void uint16_to_str(uint16_t num, char * buf, uint8_t buf_size, uint8_t base, char fill) {
+    int i = buf_size;
+    buf[--i] = '\0';
+    while (i > 0 && num > 0) {
+        const int tmp = num / base;
+        const int remain = num - (tmp * base);
+        buf[--i] = remain <= 9 ? remain + '0' : remain - 10 + 'A';
+        num = tmp;
+    }
+    while (i > 0) {
+        buf[--i] = fill;
+    }
+}
+
+
+static void my_print_char(char character);
+#pragma aux my_print_char = \
+    "mov ah, 0x02"          \
+    "int 0x21" parm[dx] modify exact[ah]
+
+
+// Prints C string - zero terminated
+static void my_print_string(const char * text) {
+    while (*text != '\0') {
+        my_print_char(*text);
+        ++text;
+    }
+}
+
+
+static void my_print_string_f(const char __far * text) {
+    while (*text != '\0') {
+        my_print_char(*text);
+        ++text;
+    }
+}
+
+
+// Prints DOS string - must be terminated by '$' character
+#pragma aux my_print_dos_string parm[dx] modify exact[ah]
+static void __declspec(naked) my_print_dos_string(const char * dos_string) {
+    // suppress Open Watcom warning: "Parameter has been defined, but not referenced"
+    dos_string;
+
+    __asm {
+        mov ah, 0x09
+        int 0x21
+        ret
+    }
 }
 
 
@@ -2274,8 +2264,9 @@ static uint8_t pktdrv_release_type(uint16_t type_handle);
 
 
 // get my own MAC addr. target MUST point to a space of at least 6 chars
-#pragma aux pktdrv_getaddr parm[di][bx] modify exact[ax bx cx dx si di bp es]
-static void __declspec(naked) pktdrv_getaddr(struct mac_addr * dst, uint16_t pkt_handle) {
+// returns actual number ob bytes copied to output buffer or negated error code
+#pragma aux pktdrv_getaddr parm[di][bx] modify exact[ax bx cx dx si di bp es] value[cx]
+static int16_t __declspec(naked) pktdrv_getaddr(struct mac_addr * dst, uint16_t pkt_handle) {
     // suppress Open Watcom warning: "Parameter has been defined, but not referenced"
     dst;
     pkt_handle;
@@ -2299,6 +2290,14 @@ static void __declspec(naked) pktdrv_getaddr(struct mac_addr * dst, uint16_t pkt
 
         pop ds
 
+        jc error  // if carry, errorcode returned in DH
+
+        ret
+
+    error:
+        xor cx, cx
+        mov cl, dh
+        neg cx
         ret
     }
     // clang-format on
@@ -2315,27 +2314,79 @@ static uint8_t pktdrv_init(uint8_t pktdrv_int_num) {
     pktdrvfunc += 3;  // skip three bytes of executable code
     for (unsigned int i = 0; i < sizeof(PKTDRV_SIGNATURE); ++i) {
         if (PKTDRV_SIGNATURE[i] != pktdrvfunc[i]) {
+            // Packet driver signature not found
             return -1;
         }
     }
 
-    // fetch the vector of the pktdrv interrupt and save it for later
     *getptr_global_pktdrv_INT_handler() = pktdrv_pktcall;
 
+    // String representation of pktdrv_int_num for error messages
+    char str_pktdrv_int_num[3];
+    uint16_to_str(pktdrv_int_num, str_pktdrv_int_num, sizeof(str_pktdrv_int_num), 16, '0');
+
     uint8_t error_code;
+
     const uint16_t ether_type_arp = swap_word(ETHER_TYPE_ARP);
     error_code = pktdrv_register_type(&ether_type_arp, &pktdrv_recv, &getptr_shared_data()->arp_pkthandle);
     if (error_code == 0) {
         const uint16_t ether_type_ipv4 = swap_word(ETHER_TYPE_IPV4);
         error_code = pktdrv_register_type(&ether_type_ipv4, &pktdrv_recv, &getptr_shared_data()->ipv4_pkthandle);
         if (error_code != 0) {
-            pktdrv_release_type(ether_type_arp);
+            pktdrv_release_type(getptr_shared_data()->arp_pkthandle);
+        }
+    }
+    if (error_code != 0) {
+        my_print_dos_string("Packet driver at interrupt 0x$");
+        my_print_string(str_pktdrv_int_num);
+        my_print_dos_string(" failed to register handle for access type\r\n$");
+        return error_code;
+    }
+
+    struct mac_addr * const addr = &getptr_shared_data()->local_mac_addr;
+    const int16_t ret = pktdrv_getaddr(addr, getptr_shared_data()->ipv4_pkthandle);
+    if (ret == sizeof(*addr)) {
+        int all_zeros = 1;
+        int all_FF = 1;
+        for (int i = 0; i < sizeof(*addr); ++i) {
+            if (addr->bytes[i] != 0) {
+                all_zeros = 0;
+            }
+            if (addr->bytes[i] != 0xFF) {
+                all_FF = 0;
+            }
+        }
+
+        if (!all_zeros && !all_FF) {
+            getptr_shared_data()->used_pktdrv_int = pktdrv_int_num;
+            return 0;
+        }
+
+        my_print_dos_string("Packet driver at interrupt 0x$");
+        my_print_string(str_pktdrv_int_num);
+        my_print_dos_string(" returned an incorrect local MAC address: $");
+        if (all_zeros) {
+            my_print_dos_string("00:00:00:00:00:00\r\n$");
+        } else {
+            my_print_dos_string("FF:FF:FF:FF:FF:FF\r\n$");
+        }
+        error_code = PKTDRV_ERROR_BAD_ADDRESS;
+    } else {
+        if (ret >= 0) {
+            my_print_dos_string("Packet driver at interrupt 0x$");
+            my_print_string(str_pktdrv_int_num);
+            my_print_dos_string(" returned an incorrect local MAC address length\r\n$");
+            error_code = PKTDRV_ERROR_BAD_ADDRESS;
+        } else {
+            my_print_dos_string("Getting local MAC address for packet driver at interrupt 0x$");
+            my_print_string(str_pktdrv_int_num);
+            my_print_dos_string(" returned an error\r\n$");
+            error_code = -ret;
         }
     }
 
-    if (error_code == 0) {
-        getptr_shared_data()->used_pktdrv_int = pktdrv_int_num;
-    }
+    pktdrv_release_type(getptr_shared_data()->ipv4_pkthandle);
+    pktdrv_release_type(getptr_shared_data()->arp_pkthandle);
 
     return error_code;
 }
@@ -2348,47 +2399,33 @@ static struct shared_data __far * get_installed_shared_data_ptr(uint8_t multiple
     "int 0x2F" parm[ah] modify exact[ax bx cx] value[cx bx]
 
 
-static void uint16_to_str(uint16_t num, char * buf, uint8_t buf_size, uint8_t base, char fill) {
-    int i = buf_size;
-    buf[--i] = '\0';
-    while (i > 0 && num > 0) {
-        const int tmp = num / base;
-        const int remain = num - (tmp * base);
-        buf[--i] = remain <= 9 ? remain + '0' : remain - 10 + 'A';
-        num = tmp;
+#define STRINGIFY(x) #x
+#define TOSTRING(x)  STRINGIFY(x)
+
+
+static int check_netmount_compatibility(struct shared_data const __far * shared_data_ptr) {
+    if (shared_data_ptr->abi_version != ABI_VERSION) {
+        my_print_dos_string("Error: Incompatible NetMount client installed\r\nInstalled \"$");
+        my_print_string_f(shared_data_ptr->netmount_version);
+        my_print_dos_string("\" with ABI version $");
+        char buf[6];
+        uint16_to_str(shared_data_ptr->abi_version, buf, sizeof(buf), 10, ' ');
+        my_print_string(buf);
+        my_print_dos_string(", expected \"" NETMOUNT_VERSION "\" with ABI version " TOSTRING(ABI_VERSION) "\r\n$");
+        return EXIT_INCOMPATIBLE_VERSION;
     }
-    while (i > 0) {
-        buf[--i] = fill;
+
+    int i = 0;
+    while (NETMOUNT_VERSION[i] != '\0' && NETMOUNT_VERSION[i] == shared_data_ptr->netmount_version[i]) {
+        ++i;
     }
-}
-
-
-static void my_print_char(char character);
-#pragma aux my_print_char = \
-    "mov ah, 0x02"          \
-    "int 0x21" parm[dx] modify exact[ah]
-
-
-// Prints C string - zero terminated
-static void my_print_string(const char * text) {
-    while (*text != '\0') {
-        my_print_char(*text);
-        ++text;
+    if (NETMOUNT_VERSION[i] != '\0' || shared_data_ptr->netmount_version[i] != '\0') {
+        my_print_dos_string("Info: A different NetMount client version is installed\r\nInstalled \"$");
+        my_print_string_f(shared_data_ptr->netmount_version);
+        my_print_dos_string("\", expected \"" NETMOUNT_VERSION "\". The versions are ABI-compatible.\r\n$");
     }
-}
 
-
-// Prints DOS string - must be terminated by '$' character
-#pragma aux my_print_dos_string parm[dx] modify exact[ah]
-static void __declspec(naked) my_print_dos_string(const char * dos_string) {
-    // suppress Open Watcom warning: "Parameter has been defined, but not referenced"
-    dos_string;
-
-    __asm {
-        mov ah, 0x09
-        int 0x21
-        ret
-    }
+    return EXIT_OK;
 }
 
 
@@ -2400,17 +2437,15 @@ static int umount(struct shared_data __far * shared_data_ptr, uint8_t drive_no) 
     }
     cds->flags = 0;
 
-    shared_data_ptr->ldrv[drive_no] = 0xFF;
+    shared_data_ptr->drive_map[drive_no] = 0xFF;
     shared_data_ptr->drives[drive_no].remote_ip_idx = 0xFF;
     return 0;
 }
 
-#define STRINGIFY(x) #x
-#define TOSTRING(x)  STRINGIFY(x)
 
 static void print_help(void) {
     my_print_dos_string(
-        "NetMount " PROGRAM_VERSION
+        "NetMount " NETMOUNT_VERSION
         ", Copyright 2024-2025 Jaroslav Rohel <jaroslav.rohel@gmail.com>\r\n"
 #ifdef PC98
  #ifdef DOS3
@@ -2448,10 +2483,10 @@ static void print_help(void) {
         "/IP:<local_ipv4_addr>     Sets local IP address\r\n"
         "/PORT:<local_udp_port>    Sets local UDP port. " TOSTRING(DRIVE_PROTO_UDP_PORT) " by default\r\n"
         "/PKT_INT:<packet_drv_int> Sets interrupt of used packet driver.\r\n"
-        "                          First found in range 0x60 - 0x80 by default.\r\n"
+        "                          First found in range " TOSTRING(MIN_PKT_INT) " - " TOSTRING(MAX_PKT_INT) " by default.\r\n"
         "/MASK:<net_mask>          Sets network mask\r\n"
         "/GW:<gateway_addr>        Sets gateway address\r\n"
-        "/MTU:<size>               Interface MTU (560-" TOSTRING(MAX_INTERFACE_MTU) ", default " TOSTRING(DEFAULT_INTERFACE_MTU) ")\r\n"
+        "/MTU:<size>               Interface MTU (" TOSTRING(MIN_MTU) "-" TOSTRING(MAX_MTU) ", default " TOSTRING(DEFAULT_MTU) ")\r\n"
         "/NO_ARP_REQUESTS          Don't send ARP requests. Replying is allowed\r\n"
         "<local_drive_letter>      Specifies local drive to mount/unmount (e.g. H)\r\n"
         "<remote_drive_letter>     Specifies remote drive to mount/unmount (e.g. H)\r\n"
@@ -2459,10 +2494,10 @@ static void print_help(void) {
         "<remote_ipv4_addr>        Specifies IP address of remote server\r\n"
         "<remote_udp_port>         Specifies remote UDP port. " TOSTRING(DRIVE_PROTO_UDP_PORT) " by default\r\n"
         "/CHECKSUMS:<names>        Enabled checksums (IP_HEADER,NETMOUNT; both default)\r\n"
-        "/MIN_RCV_TMO:<seconds>    Minimum response timeout (1-56, default " TOSTRING(DEFAULT_MIN_RCV_TMO_SECONDS) ")\r\n"
-        "/MAX_RCV_TMO:<seconds>    Maximum response timeout (1-56, default " TOSTRING(DEFAULT_MAX_RCV_TMO_SECONDS) ")\r\n"
-        "/MAX_RETRIES:<count>      Maximum number of request retries (0-254, default " TOSTRING(DEFAULT_MAX_NUM_REQUEST_RETRIES) ")\r\n"
-        "/MIN_READ_LEN:<length>    Minimum data read len (0-" TOSTRING(FILE_BUFFER_SIZE) ", power of 2, default " TOSTRING(FILE_BUFFER_SIZE) ")\r\n"
+        "/MIN_RCV_TMO:<seconds>    Minimum response timeout (" TOSTRING(MIN_MIN_RCV_TMO_SEC) "-" TOSTRING(MAX_MIN_RCV_TMO_SEC) ", default " TOSTRING(DEFAULT_MIN_RCV_TMO_SEC) ")\r\n"
+        "/MAX_RCV_TMO:<seconds>    Maximum response timeout (" TOSTRING(MIN_MAX_RCV_TMO_SEC) "-" TOSTRING(MAX_MAX_RCV_TMO_SEC) ", default " TOSTRING(DEFAULT_MAX_RCV_TMO_SEC) ")\r\n"
+        "/MAX_RETRIES:<count>      Maximum number of request retries (" TOSTRING(MIN_MAX_RETRIES) "-" TOSTRING(MAX_MAX_RETRIES) ", default " TOSTRING(DEFAULT_MAX_RETRIES) ")\r\n"
+        "/MIN_READ_LEN:<length>    Minimum data read len (" TOSTRING(MIN_MIN_READ_LEN) "-" TOSTRING(MAX_MIN_READ_LEN) ", power of 2, default " TOSTRING(DEFAULT_MIN_READ_LEN) ")\r\n"
         "/?                        Display this help\r\n$");
 }
 
@@ -2505,12 +2540,19 @@ int main(int argc, char * argv[]) {
             return EXIT_NOT_INSTALLED;
         }
 
+        struct shared_data __far * const shared_data_ptr = get_installed_shared_data_ptr(info.multiplex_id);
+
+        {
+            int exit_code = check_netmount_compatibility(shared_data_ptr);
+            if (exit_code != EXIT_OK) {
+                return exit_code;
+            }
+        }
+
         if (argc != 2) {
             my_print_dos_string("Uninstall does not take additional arguments\r\n$");
             return EXIT_BAD_ARG;
         }
-
-        struct shared_data __far * const shared_data_ptr = get_installed_shared_data_ptr(info.multiplex_id);
 
         interrupt_handler current_INT2F_handler = get_intr_vector(0x2F);
         if (current_INT2F_handler != MK_FP(shared_data_ptr->psp_segment, shared_data_ptr->int2F_redirector_offset)) {
@@ -2519,7 +2561,7 @@ int main(int argc, char * argv[]) {
         }
 
         for (int drive_no = 0; drive_no < MAX_DRIVES_COUNT; ++drive_no) {
-            if (shared_data_ptr->ldrv[drive_no] != 0xFF) {
+            if (shared_data_ptr->drive_map[drive_no] != 0xFF) {
                 my_print_dos_string("NetMount cannot be removed: mounted drives detected\r\n$");
                 return EXIT_DRIVE_MOUNTED;
             }
@@ -2583,7 +2625,7 @@ int main(int argc, char * argv[]) {
         getptr_shared_data()->local_port = DRIVE_PROTO_UDP_PORT;
         getptr_shared_data()->net_mask.value = 0;
         getptr_shared_data()->requested_pktdrv_int = 0;
-        getptr_shared_data()->interface_mtu = DEFAULT_INTERFACE_MTU;
+        getptr_shared_data()->interface_mtu = DEFAULT_MTU;
         getptr_shared_data()->disable_sending_arp_request = 0;
         for (int i = 2; i < argc; ++i) {
             if (argv[i][0] != '/') {
@@ -2636,8 +2678,11 @@ int main(int argc, char * argv[]) {
             if (strn_upper_cmp(argv[i] + 1, "PKT_INT:", 8) == 0) {
                 const char * endptr;
                 getptr_shared_data()->requested_pktdrv_int = strto_ui16(argv[i] + 9, &endptr);
-                if (getptr_shared_data()->requested_pktdrv_int < 0x60) {
-                    my_print_dos_string("Error: Packet driver interrupt must be in range 0x60-0xFF\r\n$");
+                if (getptr_shared_data()->requested_pktdrv_int < MIN_PKT_INT ||
+                    getptr_shared_data()->requested_pktdrv_int > MAX_PKT_INT) {
+                    my_print_dos_string(
+                        "Error: Packet driver interrupt must be in range " TOSTRING(MIN_PKT_INT) "-" TOSTRING(
+                            MAX_PKT_INT) "\r\n$");
                     return EXIT_BAD_ARG;
                 }
                 continue;
@@ -2645,9 +2690,9 @@ int main(int argc, char * argv[]) {
             if (strn_upper_cmp(argv[i] + 1, "MTU:", 4) == 0) {
                 const char * endptr;
                 getptr_shared_data()->interface_mtu = strto_ui16(argv[i] + 5, &endptr);
-                if (getptr_shared_data()->interface_mtu > 1500 || getptr_shared_data()->interface_mtu < 560) {
+                if (getptr_shared_data()->interface_mtu > MAX_MTU || getptr_shared_data()->interface_mtu < MIN_MTU) {
                     my_print_dos_string(
-                        "Error: Interface MTU must be in the range 560-" TOSTRING(MAX_INTERFACE_MTU) "\r\n$");
+                        "Error: Interface MTU must be in the range " TOSTRING(MIN_MTU) "-" TOSTRING(MAX_MTU) "\r\n$");
                     return EXIT_BAD_ARG;
                 }
                 continue;
@@ -2680,43 +2725,53 @@ int main(int argc, char * argv[]) {
             }
         }
 
+        *getptr_global_recv_data_len() = 1;  // Blocking frame reception by marking the receive buffer as full
+
         // init the packet driver interface
         getptr_shared_data()->used_pktdrv_int = 0;
         if (getptr_shared_data()->requested_pktdrv_int == 0) {
-            // detect first packet driver within int 0x60..0x80
-            for (int i = 0x60; i <= 0x80; ++i) {
+            // detect first packet driver within int MIN_PKT_INT..MAX_PKT_INT
+            for (int i = MIN_PKT_INT; i <= MAX_PKT_INT; ++i) {
                 if (pktdrv_init(i) == 0) {
                     break;
                 }
             }
+            if (getptr_shared_data()->used_pktdrv_int == 0) {
+                my_print_dos_string("Error: Usable packet driver not found\r\n$");
+                return EXIT_PKTDRV_INIT_FAILED;
+            }
+
         } else {
             // use the pktdrvr interrupt passed through command line
             pktdrv_init(getptr_shared_data()->requested_pktdrv_int);
-        }
-        // has it succeeded?
-        if (getptr_shared_data()->used_pktdrv_int == 0) {
-            my_print_dos_string("Packet driver initialization failed.\r\n$");
-            return EXIT_PKTDRV_INIT_FAILED;
-        }
-        my_print_dos_string("Use packet driver with interrupt number 0x$");
-        char num_int[3];
-        uint16_to_str(getptr_shared_data()->used_pktdrv_int, num_int, sizeof(num_int), 16, '0');
-        my_print_string(num_int);
-        my_print_dos_string("\r\n$");
-
-        pktdrv_getaddr(&getptr_shared_data()->local_mac_addr, getptr_shared_data()->ipv4_pkthandle);
-        my_print_dos_string("Detected local MAC address $");
-        int first = 1;
-        for (int i = 0; i < 6; ++i) {
-            if (!first) {
-                my_print_char(':');
+            if (getptr_shared_data()->used_pktdrv_int == 0) {
+                my_print_dos_string("Error: Packet driver initialization failed\r\n$");
+                return EXIT_PKTDRV_INIT_FAILED;
             }
-            char buf[3];
-            uint16_to_str(getptr_shared_data()->local_mac_addr.bytes[i], buf, sizeof(buf), 16, '0');
-            my_print_string(buf);
-            first = 0;
         }
-        my_print_dos_string("\r\n$");
+
+        {
+            my_print_dos_string("Using the packet driver on interrupt 0x$");
+            char num_int[3];
+            uint16_to_str(getptr_shared_data()->used_pktdrv_int, num_int, sizeof(num_int), 16, '0');
+            my_print_string(num_int);
+            my_print_dos_string("\r\n$");
+        }
+
+        {
+            my_print_dos_string("Detected local MAC address $");
+            int first = 1;
+            for (int i = 0; i < 6; ++i) {
+                if (!first) {
+                    my_print_char(':');
+                }
+                char buf[3];
+                uint16_to_str(getptr_shared_data()->local_mac_addr.bytes[i], buf, sizeof(buf), 16, '0');
+                my_print_string(buf);
+                first = 0;
+            }
+            my_print_dos_string("\r\n$");
+        }
 
         {
             struct ether_frame * const frame = getptr_global_send_buff();
@@ -2746,8 +2801,8 @@ int main(int argc, char * argv[]) {
         }
 
         // set all drive mappings as 'unused'
-        for (int i = 0; i < sizeof(getptr_shared_data()->ldrv); ++i)
-            getptr_shared_data()->ldrv[i] = 0xFF;
+        for (int i = 0; i < sizeof(getptr_shared_data()->drive_map); ++i)
+            getptr_shared_data()->drive_map[i] = 0xFF;
 
         *getptr_global_sda_ptr() = get_sda();
 
@@ -2762,6 +2817,14 @@ int main(int argc, char * argv[]) {
             my_print_dos_string("\r\n$");
         }
 
+        // Stores version information in shared data for use by external programs.
+        getptr_shared_data()->abi_version = ABI_VERSION;
+        getptr_shared_data()->min_compatible_abi_version = MIN_COMPATIBLE_ABI_VERSION;
+        my_memcpy_ff(
+            getptr_shared_data()->netmount_version,
+            NETMOUNT_VERSION,
+            min_u16(sizeof(NETMOUNT_VERSION) - 1, sizeof(getptr_shared_data()->netmount_version) - 1));
+
         // This data is saved to a shared area and is used by UNINSTALL.
         getptr_shared_data()->psp_segment = get_current_psp_address_segment();
         getptr_shared_data()->orig_INT2F_handler = *getptr_global_orig_INT2F_handler();
@@ -2773,6 +2836,8 @@ int main(int argc, char * argv[]) {
         free_memory(psp_ptr->env_segment);
         psp_ptr->env_segment = 0;  // The memory has been released; let's not reference it anymore
 
+        *getptr_global_recv_data_len() = 0;  // Unblocking frame reception by marking the receive buffer as empty
+
         terminate_remain_resident(EXIT_OK, ((unsigned)get_offset(resident_part_end_mark) + PROGRAM_OFFSET + 15) >> 4);
     }
 
@@ -2783,16 +2848,25 @@ int main(int argc, char * argv[]) {
             return EXIT_NOT_INSTALLED;
         }
 
+        struct shared_data __far * const shared_data_ptr = get_installed_shared_data_ptr(info.multiplex_id);
+
+        {
+            int exit_code = check_netmount_compatibility(shared_data_ptr);
+            if (exit_code != EXIT_OK) {
+                return exit_code;
+            }
+        }
+
         int mount_drive_set = 0;
         union ipv4_addr remote_ip;
         uint16_t remote_port = DRIVE_PROTO_UDP_PORT;
         uint8_t remote_drive_no;
         uint8_t drive_no;
-        uint16_t min_rcv_tmo_sec = DEFAULT_MIN_RCV_TMO_SECONDS;
-        uint16_t max_rcv_tmo_sec = DEFAULT_MAX_RCV_TMO_SECONDS;
-        uint8_t max_request_retries = DEFAULT_MAX_NUM_REQUEST_RETRIES;
+        uint16_t min_rcv_tmo_sec = DEFAULT_MIN_RCV_TMO_SEC;
+        uint16_t max_rcv_tmo_sec = DEFAULT_MAX_RCV_TMO_SEC;
+        uint8_t max_request_retries = DEFAULT_MAX_RETRIES;
         uint8_t enabled_checksums = DEFAULT_ENABLED_CHECKSUMS;
-        uint8_t min_server_read_len = FILE_BUFFER_SIZE;
+        uint8_t min_server_read_len = DEFAULT_MIN_READ_LEN;
         for (int i = 2; i < argc; ++i) {
             if (argv[i][0] != '/') {
                 // NetMount mount <ipv4_addr>[:port]/<remote_drive> <local_drive>
@@ -2858,8 +2932,10 @@ int main(int argc, char * argv[]) {
             if (strn_upper_cmp(argv[i] + 1, "MIN_RCV_TMO:", 12) == 0) {
                 const char * endptr;
                 min_rcv_tmo_sec = strto_ui16(argv[i] + 13, &endptr);
-                if (min_rcv_tmo_sec < 1 || min_rcv_tmo_sec > 56) {
-                    my_print_dos_string("Error: Minimum response timeout must be in range 1-56\r\n$");
+                if (min_rcv_tmo_sec < MIN_MIN_RCV_TMO_SEC || min_rcv_tmo_sec > MAX_MIN_RCV_TMO_SEC) {
+                    my_print_dos_string(
+                        "Error: Minimum response timeout must be in range " TOSTRING(MIN_MIN_RCV_TMO_SEC) "-" TOSTRING(
+                            MAX_MIN_RCV_TMO_SEC) "\r\n$");
                     return EXIT_BAD_ARG;
                 }
                 continue;
@@ -2867,28 +2943,36 @@ int main(int argc, char * argv[]) {
             if (strn_upper_cmp(argv[i] + 1, "MAX_RCV_TMO:", 12) == 0) {
                 const char * endptr;
                 max_rcv_tmo_sec = strto_ui16(argv[i] + 13, &endptr);
-                if (max_rcv_tmo_sec < 1 || max_rcv_tmo_sec > 56) {
-                    my_print_dos_string("Error: Maximum response timeout must be in range 1-56\r\n$");
+                if (max_rcv_tmo_sec < MIN_MAX_RCV_TMO_SEC || max_rcv_tmo_sec > MAX_MAX_RCV_TMO_SEC) {
+                    my_print_dos_string(
+                        "Error: Maximum response timeout must be in range " TOSTRING(MIN_MAX_RCV_TMO_SEC) "-" TOSTRING(
+                            MAX_MAX_RCV_TMO_SEC) "\r\n$");
                     return EXIT_BAD_ARG;
                 }
                 continue;
             }
             if (strn_upper_cmp(argv[i] + 1, "MAX_RETRIES:", 12) == 0) {
                 const char * endptr;
-                max_request_retries = strto_ui16(argv[i] + 13, &endptr);
-                if (endptr == argv[i] + 13 || max_request_retries > 254) {
-                    my_print_dos_string("Error: Maximum request retries must be in range 0-254\r\n$");
+                const int16_t tmp_max_request_retries = strto_ui16(argv[i] + 13, &endptr);
+                if (endptr == argv[i] + 13 || tmp_max_request_retries > MAX_MAX_RETRIES ||
+                    tmp_max_request_retries < MIN_MAX_RETRIES) {
+                    my_print_dos_string(
+                        "Error: Maximum request retries must be in range " TOSTRING(MIN_MAX_RETRIES) "-" TOSTRING(
+                            MAX_MAX_RETRIES) "\r\n$");
                     return EXIT_BAD_ARG;
                 }
+                max_request_retries = tmp_max_request_retries;
                 continue;
             }
             if (strn_upper_cmp(argv[i] + 1, "MIN_READ_LEN:", 13) == 0) {
                 const char * endptr;
                 min_server_read_len = strto_ui16(argv[i] + 14, &endptr);
                 // The value must be a power of two and no greater than FILE_BUFFER_SIZE.
-                if (endptr == argv[i] + 14 || min_server_read_len > FILE_BUFFER_SIZE ||
+                if (endptr == argv[i] + 14 || min_server_read_len > MAX_MIN_READ_LEN ||
                     (min_server_read_len & (min_server_read_len - 1)) != 0) {
-                    my_print_dos_string("Error: Minimum read length must be power of 2 in range 0-64\r\n$");
+                    my_print_dos_string(
+                        "Error: Minimum read length must be power of 2 in range " TOSTRING(
+                            MIN_MIN_READ_LEN) "-" TOSTRING(MAX_MIN_READ_LEN) "\r\n$");
                     return EXIT_BAD_ARG;
                 }
                 continue;
@@ -2920,8 +3004,6 @@ int main(int argc, char * argv[]) {
             return EXIT_DRIVE_LETTER_ALREADY_USED;
         }
 
-        struct shared_data __far * const shared_data_ptr = get_installed_shared_data_ptr(info.multiplex_id);
-
         const uint8_t remote_ip_idx = assign_remote_ip_addr_slot(shared_data_ptr, remote_ip);
         if (remote_ip_idx == 0xFF) {
             my_print_dos_string("Error: Not free slot for remote IP address\r\n$");
@@ -2932,7 +3014,7 @@ int main(int argc, char * argv[]) {
 
         drv_info->remote_ip_idx = remote_ip_idx;
         drv_info->remote_port = remote_port;
-        shared_data_ptr->ldrv[drive_no] = remote_drive_no;
+        shared_data_ptr->drive_map[drive_no] = remote_drive_no;
 
         // Convert timeouts to 18.2 Hz ticks (2 least significant bits ignored). Uses only integer operations.
         drv_info->min_rcv_tmo_18_2_ticks_shr_2 = ((min_rcv_tmo_sec * TICK_HZ10) / 10) >> 2;
@@ -2963,18 +3045,25 @@ int main(int argc, char * argv[]) {
             return EXIT_NOT_INSTALLED;
         }
 
+        struct shared_data __far * const shared_data_ptr = get_installed_shared_data_ptr(info.multiplex_id);
+
+        {
+            int exit_code = check_netmount_compatibility(shared_data_ptr);
+            if (exit_code != EXIT_OK) {
+                return exit_code;
+            }
+        }
+
         if (argc != 3) {
             my_print_dos_string("Bad argument count. Use umount <local_drive_letter> or /ALL\r\n$");
             return EXIT_BAD_ARG;
         }
 
-        struct shared_data __far * const shared_data_ptr = get_installed_shared_data_ptr(info.multiplex_id);
-
         int retval = EXIT_OK;
 
         if (strn_upper_cmp(argv[2], "/ALL", 5) == 0) {
             for (int drive_no = 0; drive_no < MAX_DRIVES_COUNT; ++drive_no) {
-                if (shared_data_ptr->ldrv[drive_no] != 0xFF) {
+                if (shared_data_ptr->drive_map[drive_no] != 0xFF) {
                     retval |= umount(shared_data_ptr, drive_no);
                 }
             }
@@ -2985,7 +3074,7 @@ int main(int argc, char * argv[]) {
                 my_print_dos_string("Bad local drive letter\r\n$");
                 return EXIT_BAD_DRIVE_LETTER;
             }
-            if (shared_data_ptr->ldrv[drive_no] == 0xFF) {
+            if (shared_data_ptr->drive_map[drive_no] == 0xFF) {
                 my_print_dos_string("Drive is not mounted by NetMount\r\n$");
                 return EXIT_DRIVE_NOT_MOUNTED;
             }
