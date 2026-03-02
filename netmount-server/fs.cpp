@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Copyright 2025 Jaroslav Rohel, jaroslav.rohel@gmail.com
+// Copyright 2025-2026 Jaroslav Rohel, jaroslav.rohel@gmail.com
 
 #include "fs.hpp"
 
@@ -24,7 +24,9 @@
 #include <compare>
 #include <exception>
 #include <format>
+#include <fstream>
 #include <string_view>
+#include <tuple>
 
 
 std::strong_ordering operator<=>(const fcb_file_name & lhs, const fcb_file_name & rhs) noexcept {
@@ -80,6 +82,8 @@ void change_dir(const std::filesystem::path & dir);
 // Throws exception on error.
 DosFileProperties create_or_truncate_file(const std::filesystem::path & path, uint8_t attrs, AttrsMode mode);
 
+void try_open_file(const std::filesystem::path & path, uint8_t open_mode);
+
 // Resize file
 // Throws exception on error.
 void resize_file(const std::filesystem::path & path, uint32_t new_size);
@@ -133,6 +137,14 @@ uint32_t time_to_fat(time_t t) {
     uint32_t res;
     struct tm * ltime;
     ltime = localtime(&t);
+    if (ltime->tm_year < 80) {
+        // 1980-01-01 00:00:00 - DOS FAT minimum timestamp
+        return ((1U << 5) + 1U) << 16;
+    }
+    if (ltime->tm_year > 207) {
+        // 2107-12-31 23:59:58 - DOS FAT maximu timestamp
+        return (((0x7FU << 9) + (12U << 5) + 31U) << 16) + (23U << 11) + (59U << 5) + (58U >> 1);
+    }
     res = ltime->tm_year - 80;  // tm_year is years from 1900, FAT is years from 1980
     res <<= 4;
     res |= ltime->tm_mon + 1;  // tm_mon is in range 0..11 while FAT expects 1..12
@@ -145,6 +157,38 @@ uint32_t time_to_fat(time_t t) {
     res <<= 5;
     res |= ltime->tm_sec / 2;  // DOS stores seconds divided by two
     return res;
+}
+
+
+time_t fat_to_time(uint32_t date_time) {
+    struct tm ltime;
+    ltime.tm_isdst = -1;
+    ltime.tm_sec = (date_time & 0x1f) * 2;
+    date_time >>= 5;
+    ltime.tm_min = date_time & 0x3f;
+    date_time >>= 6;
+    ltime.tm_hour = date_time & 0x1f;
+    date_time >>= 5;
+    ltime.tm_mday = date_time & 0x1f;
+    date_time >>= 5;
+    ltime.tm_mon = (date_time & 0x0f) - 1;
+    date_time >>= 4;
+    ltime.tm_year = date_time + 80;
+    return mktime(&ltime);
+}
+
+
+bool is_dangling_symlink(const std::filesystem::path & p) {
+    std::error_code ec;
+    if (!std::filesystem::is_symlink(p, ec)) {
+        return false;
+    }
+
+    if (!std::filesystem::exists(p, ec)) {
+        return true;
+    }
+
+    return false;
 }
 
 }  // namespace
@@ -256,12 +300,14 @@ uint16_t Drive::get_handle(const std::filesystem::path & server_path) {
 
 Drive::Item & Drive::get_item(uint16_t handle) {
     if (handle >= items.size()) {
-        throw std::runtime_error(
-            std::format("Handle {} is invalid - only {} handles are currently allocated", handle, items.size()));
+        throw FilesystemError(
+            std::format("Handle {} is invalid - only {} handles are currently allocated", handle, items.size()),
+            DOS_EXTERR_INVALID_HANDLE);
     }
     Item & item = items[handle];
     if (item.path.empty()) {
-        throw std::runtime_error(std::format("Handle {} is invalid because it is empty", handle));
+        throw FilesystemError(
+            std::format("Handle {} is invalid because it is empty", handle), DOS_EXTERR_INVALID_HANDLE);
     }
     return item;
 }
@@ -281,19 +327,23 @@ int32_t Drive::read_file(void * buffer, uint16_t handle, uint32_t offset, uint16
 
     item.update_last_used_timestamp();
 
+    if (is_dangling_symlink(fname)) {
+        throw FilesystemError("read_file: Dangling symlink: " + fname.string(), DOS_EXTERR_ACCESS_DENIED);
+    }
+
 #ifdef _WIN32
     auto * const fd = _wfopen(fname.c_str(), L"rb");
 #else
     auto * const fd = fopen(fname.c_str(), "rb");
 #endif
     if (!fd) {
-        throw std::runtime_error(std::format("Cannot open file: {}", strerror(errno)));
+        throw FilesystemError(std::format("Cannot open file: {}", strerror(errno)), DOS_EXTERR_ACCESS_DENIED);
     }
 
     if (fseek(fd, offset, SEEK_SET) != 0) {
         const auto orig_errno = errno;
         fclose(fd);
-        throw std::runtime_error(std::format("Cannot seek in file: {}", strerror(orig_errno)));
+        throw FilesystemError(std::format("Cannot seek in file: {}", strerror(orig_errno)), DOS_EXTERR_SEEK_ERROR);
     }
 
     const auto res = fread(buffer, 1, len, fd);
@@ -305,16 +355,27 @@ int32_t Drive::read_file(void * buffer, uint16_t handle, uint32_t offset, uint16
 
 
 int32_t Drive::write_file(const void * buffer, uint16_t handle, uint32_t offset, uint16_t len) {
+    if (is_read_only()) {
+        throw FilesystemError(std::string(__func__) + ": Drive is read-only", DOS_EXTERR_DISK_WRITE_PROTECTED);
+    }
+
     auto & item = get_item(handle);
     const auto & fname = item.path;
 
     item.update_last_used_timestamp();
 
-    if (get_server_path_attrs(fname) & FAT_RO) {
-        throw FilesystemError(
-            std::format("Access denied: File \"{}\" has the READ_ONLY attribute", fname.string()),
-            DOS_EXTERR_ACCESS_DENIED);
+    if (is_dangling_symlink(fname)) {
+        throw FilesystemError("read_file: Dangling symlink: " + fname.string(), DOS_EXTERR_ACCESS_DENIED);
     }
+
+    // READ_ONLY DOS attribute is handled at open time. Do not check it here.
+    // Files opened with CREATE_FILE (create or truncate) must remain writable.
+    // Checking it here would wrongly block writes to a newly created/truncated file.
+    //if (get_server_path_attrs(fname) & FAT_RO) {
+    //    throw FilesystemError(
+    //        std::format("Access denied: File \"{}\" has the READ_ONLY attribute", fname.string()),
+    //        DOS_EXTERR_ACCESS_DENIED);
+    //}
 
     // len 0 means "truncate" or "extend"
     if (len == 0) {
@@ -331,13 +392,13 @@ int32_t Drive::write_file(const void * buffer, uint16_t handle, uint32_t offset,
     auto * const fd = fopen(fname.c_str(), "r+b");
 #endif
     if (!fd) {
-        throw std::runtime_error(std::format("Cannot open file: {}", strerror(errno)));
+        throw FilesystemError(std::format("Cannot open file: {}", strerror(errno)), DOS_EXTERR_ACCESS_DENIED);
     }
 
     if (fseek(fd, offset, SEEK_SET) != 0) {
         const auto orig_errno = errno;
         fclose(fd);
-        throw std::runtime_error(std::format("Cannot seek in file: {}", strerror(orig_errno)));
+        throw FilesystemError(std::format("Cannot seek in file: {}", strerror(orig_errno)), DOS_EXTERR_SEEK_ERROR);
     }
 
     const auto res = fwrite(buffer, 1, len, fd);
@@ -359,6 +420,14 @@ int32_t Drive::get_file_size(uint16_t handle) {
     item.update_last_used_timestamp();
 
     return fprops.size;
+}
+
+
+void Drive::set_file_date_time(uint16_t handle, uint32_t date_time) {
+    auto & item = get_item(handle);
+    item.last_used_time = fat_to_time(date_time);
+    auto file_time = std::chrono::file_clock::from_sys(std::chrono::system_clock::from_time_t(item.last_used_time));
+    std::filesystem::last_write_time(item.path, file_time);
 }
 
 
@@ -475,7 +544,12 @@ std::pair<std::filesystem::path, bool> Drive::create_server_path(
 
     if (get_file_name_conversion() == Drive::FileNameConversion::OFF) {
         auto server_path = root / client_path;
-        return {server_path, std::filesystem::exists(server_path)};
+        if (!std::filesystem::exists(server_path.parent_path())) {
+            throw FilesystemError(
+                std::format("create_server_path: Parent path not found: {}", server_path.parent_path().string()),
+                DOS_EXTERR_PATH_NOT_FOUND);
+        }
+        return {server_path, std::filesystem::exists(server_path) || std::filesystem::is_symlink(server_path)};
     }
 
     std::filesystem::path server_path = root;
@@ -491,8 +565,9 @@ std::pair<std::filesystem::path, bool> Drive::create_server_path(
                 server_path /= *prev_it;
                 return {server_path, false};
             }
-            throw std::runtime_error(
-                std::format("create_server_path: Parent path not found: {}", (server_path / *prev_it).string()));
+            throw FilesystemError(
+                std::format("create_server_path: Parent path not found: {}", (server_path / *prev_it).string()),
+                DOS_EXTERR_PATH_NOT_FOUND);
         }
         server_path /= server_name;
         if (it == it_end) {
@@ -503,10 +578,16 @@ std::pair<std::filesystem::path, bool> Drive::create_server_path(
 
 
 void Drive::make_dir(const std::filesystem::path & client_path) {
-    auto [server_path, exist] = create_server_path(client_path);
-    if (exist) {
-        throw std::runtime_error("make_dir: Directory exists: " + server_path.string());
+    if (is_read_only()) {
+        throw FilesystemError(std::string(__func__) + ": Drive is read-only", DOS_EXTERR_DISK_WRITE_PROTECTED);
     }
+
+    auto [server_path, exist] = create_server_path(client_path);
+
+    if (exist) {
+        throw FilesystemError("make_dir: Path exists: " + server_path.string(), DOS_EXTERR_ACCESS_DENIED);
+    }
+
     netmount_srv::make_dir(server_path);
 
     // Recreates directory_list
@@ -515,15 +596,21 @@ void Drive::make_dir(const std::filesystem::path & client_path) {
 
 
 void Drive::delete_dir(const std::filesystem::path & client_path) {
+    if (is_read_only()) {
+        throw FilesystemError(std::string(__func__) + ": Drive is read-only", DOS_EXTERR_DISK_WRITE_PROTECTED);
+    }
+
     auto [server_path, exist] = create_server_path(client_path);
+
     if (!exist) {
         throw FilesystemError(
             "delete_dir: Directory does not exist: " + server_path.string(), DOS_EXTERR_PATH_NOT_FOUND);
     }
 
-    if (get_server_path_attrs(server_path) & FAT_RO) {
-        throw FilesystemError("Access denied: Directory has the READ_ONLY attribute", DOS_EXTERR_ACCESS_DENIED);
-    }
+    // DOS ignores the READ-ONLY attribute on directories
+    //if (get_server_path_attrs(server_path) & FAT_RO) {
+    //    throw FilesystemError("Access denied: Directory has the READ_ONLY attribute", DOS_EXTERR_ACCESS_DENIED);
+    //}
 
     netmount_srv::delete_dir(server_path);
 
@@ -535,16 +622,22 @@ void Drive::delete_dir(const std::filesystem::path & client_path) {
 void Drive::change_dir(const std::filesystem::path & client_path) {
     auto [server_path, exist] = create_server_path(client_path);
     if (!exist) {
-        throw std::runtime_error("change_dir: Directory does not exist: " + server_path.string());
+        throw FilesystemError(
+            "change_dir: Directory does not exist: " + server_path.string(), DOS_EXTERR_PATH_NOT_FOUND);
     }
     netmount_srv::change_dir(server_path);
 }
 
 
 void Drive::set_item_attrs(const std::filesystem::path & client_path, uint8_t attrs) {
+    if (is_read_only()) {
+        throw FilesystemError(std::string(__func__) + ": Drive is read-only", DOS_EXTERR_DISK_WRITE_PROTECTED);
+    }
+
     const auto attrs_mode = get_attrs_mode();
     if (attrs_mode != AttrsMode::IGNORE) {
         auto [server_path, exist] = create_server_path(client_path);
+
         netmount_srv::set_item_attrs(server_path, attrs, attrs_mode);
 
         // Recreates directory_list
@@ -560,7 +653,19 @@ uint8_t Drive::get_server_path_attrs(const std::filesystem::path & server_path) 
 
 uint8_t Drive::get_dos_properties(const std::filesystem::path & client_path, DosFileProperties * properties) {
     auto [server_path, exist] = create_server_path(client_path);
-    return get_server_path_dos_properties(server_path, properties);
+    if (!exist) {
+        throw FilesystemError(
+            std::format("get_dos_properties: File not found: {}", server_path.string()), DOS_EXTERR_FILE_NOT_FOUND);
+    }
+
+    auto attrs = get_server_path_dos_properties(server_path, properties);
+    if (attrs == FAT_ERROR_ATTR) {
+        throw FilesystemError(
+            std::format("get_dos_properties: get attributes failed: {}", server_path.string()),
+            DOS_EXTERR_FILE_NOT_FOUND);
+    }
+
+    return attrs;
 }
 
 
@@ -571,8 +676,43 @@ uint8_t Drive::get_server_path_dos_properties(
 
 
 void Drive::rename_file(const std::filesystem::path & old_client_path, const std::filesystem::path & new_client_path) {
+    if (is_read_only()) {
+        throw FilesystemError(std::string(__func__) + ": Drive is read-only", DOS_EXTERR_DISK_WRITE_PROTECTED);
+    }
+
     const auto [old_server_path, exist1] = create_server_path(old_client_path);
-    const auto [new_server_path, exist2] = create_server_path(new_client_path);
+
+    std::filesystem::path new_server_path;
+    bool exist2;
+    try {
+        std::tie(new_server_path, exist2) = create_server_path(new_client_path);
+    } catch (const FilesystemError & ex) {
+        if (ex.get_dos_err_code() == DOS_EXTERR_PATH_NOT_FOUND) {
+            // Replace DOS_EXTERR_PATH_NOT_FOUND with DOS_EXTERR_FILE_NOT_FOUND
+            // for compatibility with DOS behavior.
+            //
+            // Technically, PATH_NOT_FOUND would be the correct error,
+            // since the parent directory of the new file does not exist.
+            // However, DOS reports FILE_NOT_FOUND in this situation.
+            //
+            // This DOS behavior appears to be incorrect or at least
+            // inconsistent. Nevertheless, existing applications rely on
+            // the actual DOS behavior, so we preserve it for compatibility.
+            //
+            // We are not expecting the new file to exist. If it already
+            // exists, the rename operation fails later with
+            // DOS_EXTERR_ACCESS_DENIED.
+            throw FilesystemError(
+                std::format("rename_file: Path not found: {}", new_client_path.string()), DOS_EXTERR_FILE_NOT_FOUND);
+        }
+        throw;
+    }
+    if (exist2) {
+        throw FilesystemError(
+            std::format("Access denied: Destination file \"{}\" already exists", new_server_path.string()),
+            DOS_EXTERR_ACCESS_DENIED);
+    }
+
     netmount_srv::rename_file(old_server_path, new_server_path);
 
     // Recreates directory_list
@@ -581,14 +721,24 @@ void Drive::rename_file(const std::filesystem::path & old_client_path, const std
 
 
 void Drive::delete_files(const std::filesystem::path & client_pattern) {
+    if (is_read_only()) {
+        throw FilesystemError(std::string(__func__) + ": Drive is read-only", DOS_EXTERR_DISK_WRITE_PROTECTED);
+    }
+
     const auto [server_path, exist] = create_server_path(client_pattern);
 
     if (exist) {
-        if (get_server_path_attrs(server_path) & FAT_RO) {
+        uint8_t attrs = 0;
+        try {
+            attrs = get_server_path_attrs(server_path);
+        } catch (const std::runtime_error &) {
+        }
+        if (attrs & FAT_RO) {
             throw FilesystemError(
                 std::format("Access denied: File \"{}\" has the READ_ONLY attribute", server_path.string()),
                 DOS_EXTERR_ACCESS_DENIED);
         }
+
         netmount_srv::delete_file(server_path);
         return;
     }
@@ -616,14 +766,19 @@ void Drive::delete_files(const std::filesystem::path & client_pattern) {
         // If file name conversion is turned off, we traverse the file system directly.
         for (const auto & dentry : std::filesystem::directory_iterator(directory)) {
             if (dentry.is_directory()) {
-                // skip directories
+                // skip directories and symlinks to directories
                 continue;
             }
 
             // if match, delete the file
             const auto & path_str = dentry.path().string();
             if (match_fcb_name_to_mask(filfcb, short_name_to_fcb(path_str))) {
-                if (get_server_path_attrs(dentry.path()) & FAT_RO) {
+                uint8_t attrs = 0;
+                try {
+                    attrs = get_server_path_attrs(dentry.path());
+                } catch (const std::runtime_error &) {
+                }
+                if (attrs & FAT_RO) {
                     log(LogLevel::WARNING,
                         "Access denied: File \"{}\" has the READ_ONLY attribute",
                         dentry.path().string());
@@ -650,7 +805,12 @@ void Drive::delete_files(const std::filesystem::path & client_pattern) {
 
         if (match_fcb_name_to_mask(filfcb, file_properties.fcb_name)) {
             const auto path = directory / file_properties.server_name;
-            if (get_server_path_attrs(path) & FAT_RO) {
+            uint8_t attrs = 0;
+            try {
+                attrs = get_server_path_attrs(path);
+            } catch (const std::runtime_error &) {
+            }
+            if (attrs & FAT_RO) {
                 log(LogLevel::WARNING, "Access denied: File \"{}\" has the READ_ONLY attribute", path.string());
                 continue;
             }
@@ -664,8 +824,59 @@ void Drive::delete_files(const std::filesystem::path & client_pattern) {
 }
 
 
-DosFileProperties Drive::create_or_truncate_file(const std::filesystem::path & server_path, uint8_t attrs) {
-    return netmount_srv::create_or_truncate_file(server_path, attrs, get_attrs_mode());
+DosFileProperties Drive::create_or_truncate_file(
+    const std::filesystem::path & server_path, uint8_t requested_attrs, uint8_t current_attrs) {
+    if (is_read_only()) {
+        throw FilesystemError(std::string(__func__) + ": Drive is read-only", DOS_EXTERR_DISK_WRITE_PROTECTED);
+    }
+
+    if (current_attrs != FAT_ERROR_ATTR) {
+        if ((current_attrs & (FAT_VOLUME | FAT_DIRECTORY)) != 0) {
+            throw FilesystemError(
+                std::format("{}: Item \"{}\" is either a DIR or a VOL", __func__, server_path.string()),
+                DOS_EXTERR_ACCESS_DENIED);
+        }
+        if (current_attrs & FAT_RO) {
+            throw FilesystemError(
+                std::format(
+                    "{}: Cannot replace file \"{}\" with the READ_ONLY attribute", __func__, server_path.string()),
+                DOS_EXTERR_ACCESS_DENIED);
+        }
+        if ((current_attrs & FAT_SYSTEM) && !(requested_attrs & FAT_SYSTEM)) {
+            throw FilesystemError(
+                std::format(
+                    "{}: Access denied: Replace file \"{}\" cannot remove system attribute",
+                    __func__,
+                    server_path.string()),
+                DOS_EXTERR_ACCESS_DENIED);
+        }
+    }
+
+    return netmount_srv::create_or_truncate_file(server_path, requested_attrs, get_attrs_mode());
+}
+
+
+void Drive::try_open_file(const std::filesystem::path & server_path, uint8_t open_mode, uint8_t current_attrs) {
+    if (is_read_only() && (open_mode & (OPEN_MODE_WRONLY | OPEN_MODE_RDWR))) {
+        throw FilesystemError(
+            std::string(__func__) + ": Cannot open file for write - Drive is read-only",
+            DOS_EXTERR_DISK_WRITE_PROTECTED);
+    }
+
+    if ((current_attrs & (FAT_VOLUME | FAT_DIRECTORY)) != 0) {
+        throw FilesystemError(
+            std::format("{}: Item \"{}\" is either a DIR or a VOL", __func__, server_path.string()),
+            DOS_EXTERR_ACCESS_DENIED);
+    }
+
+    if ((current_attrs & FAT_RO) && (open_mode & (OPEN_MODE_WRONLY | OPEN_MODE_RDWR))) {
+        throw FilesystemError(
+            std::format(
+                "{}: Cannot open file \"{}\" with the READ_ONLY attribute for writing", __func__, server_path.string()),
+            DOS_EXTERR_ACCESS_DENIED);
+    }
+
+    netmount_srv::try_open_file(server_path, open_mode);
 }
 
 
@@ -718,7 +929,11 @@ int32_t Drive::Item::create_directory_list(const Drive & drive) {
                         }
                         log(LogLevel::DEBUG,
                             "create_directory_list: {} -> {:.8s} {:.3s}\n",
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                            utf8_to_sjis(name),
+#else
                             name,
+#endif
                             reinterpret_cast<const char *>(fprops.fcb_name.name_blank_padded),
                             reinterpret_cast<const char *>(fprops.fcb_name.ext_blank_padded));
                         directory_list.emplace_back(fprops);
@@ -742,7 +957,11 @@ int32_t Drive::Item::create_directory_list(const Drive & drive) {
             }
             log(LogLevel::DEBUG,
                 "create_directory_list: {} -> {:.8s} {:.3s}\n",
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                utf8_to_sjis(filename.string()),
+#else
                 filename.string(),
+#endif
                 reinterpret_cast<const char *>(fprops.fcb_name.name_blank_padded),
                 reinterpret_cast<const char *>(fprops.fcb_name.ext_blank_padded));
             directory_list.emplace_back(fprops);
@@ -764,14 +983,14 @@ void Drive::Item::update_last_used_timestamp() { last_used_time = time(NULL); }
 fcb_file_name short_name_to_fcb(const std::string & short_name) noexcept {
     fcb_file_name fcb_name;
     unsigned int i = 0;
-#ifdef SHIFT_JIS
-    auto sjis_name = utf8_to_sjis(short_name);
-    auto it = sjis_name.begin();
-    const auto it_end = sjis_name.end();
-#else
-    auto it = short_name.begin();
-    const auto it_end = short_name.end();
-#endif
+    std::string short_name_work;
+    if (use_shiftjis()) {
+        short_name_work = utf8_to_sjis(short_name);
+    } else {
+        short_name_work = short_name;
+    }
+    auto it = short_name_work.begin();
+    const auto it_end = short_name_work.end();
     while (it != it_end && *it == '.') {
         fcb_name.name_blank_padded[i++] = '.';
         ++it;
@@ -779,21 +998,19 @@ fcb_file_name short_name_to_fcb(const std::string & short_name) noexcept {
             break;
         }
     }
-#ifdef SHIFT_JIS
     bool flag = false;
-#endif
     while (it != it_end && *it != '.') {
-#ifdef SHIFT_JIS
-        if(!flag) {
-            fcb_name.name_blank_padded[i++] = ascii_to_upper(*it);
-            flag = iskanji(static_cast<unsigned char>(*it));
+        if (use_shiftjis()) {
+            if (!flag) {
+                fcb_name.name_blank_padded[i++] = ascii_to_upper(*it);
+                flag = iskanji(static_cast<unsigned char>(*it));
+            } else {
+                fcb_name.name_blank_padded[i++] = *it;
+                flag = false;
+            }
         } else {
-            fcb_name.name_blank_padded[i++] = *it;
-            flag = false;
+            fcb_name.name_blank_padded[i++] = ascii_to_upper(*it);
         }
-#else
-        fcb_name.name_blank_padded[i++] = ascii_to_upper(*it);
-#endif
         ++it;
         if (i == sizeof(fcb_name.name_blank_padded)) {
             break;
@@ -813,22 +1030,20 @@ fcb_file_name short_name_to_fcb(const std::string & short_name) noexcept {
         ++it;
     }
 
-#ifdef SHIFT_JIS
     flag = false;
-#endif
     i = 0;
     for (; it != it_end && *it != '.'; ++it) {
-#ifdef SHIFT_JIS
-        if(!flag) {
-            fcb_name.ext_blank_padded[i++] = ascii_to_upper(*it);
-            flag = iskanji(static_cast<unsigned char>(*it));
+        if (use_shiftjis()) {
+            if (!flag) {
+                fcb_name.ext_blank_padded[i++] = ascii_to_upper(*it);
+                flag = iskanji(static_cast<unsigned char>(*it));
+            } else {
+                fcb_name.ext_blank_padded[i++] = *it;
+                flag = false;
+            }
         } else {
-            fcb_name.name_blank_padded[i++] = *it;
-            flag = false;
+            fcb_name.ext_blank_padded[i++] = ascii_to_upper(*it);
         }
-#else
-        fcb_name.name_blank_padded[i++] = ascii_to_upper(*it);
-#endif
         if (i == sizeof(fcb_name.ext_blank_padded)) {
             break;
         }
@@ -849,65 +1064,65 @@ std::pair<unsigned int, bool> sanitize_short_name(std::string_view in, char * ou
     static const std::set<char> allowed_special = {
         '!', '#', '$', '%', '&', '\'', '(', ')', '-', '@', '^', '_', '`', '{', '}', '~'};
 
-#ifdef SHIFT_JIS
     bool flag = false;
-#else
     const std::size_t last_non_space_idx = in.find_last_not_of(' ');
-#endif
+
     unsigned int out_len = 0;
     for (std::size_t idx = 0; idx < in.length(); ++idx) {
         const char ch = in[idx];
         if (out_len == buf_size) {
-#ifdef SHIFT_JIS
-            if(iskanji(static_cast<unsigned char>(out_buf[out_len - 1]))) {
-                out_buf[out_len - 1] = ' ';
+            if (use_shiftjis()) {
+                if (iskanji(static_cast<unsigned char>(out_buf[out_len - 1]))) {
+                    out_buf[out_len - 1] = ' ';
+                }
             }
-#endif
             return {out_len, true};
         }
-#ifdef SHIFT_JIS
-        if(!flag) {
-            if(iskanji(static_cast<unsigned char>(ch))) {
+        if (use_shiftjis()) {
+            if (!flag) {
+                if (iskanji(static_cast<unsigned char>(ch))) {
+                    out_buf[out_len++] = ch;
+                    flag = true;
+                    continue;
+                } else if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || allowed_special.contains(ch) || ishalfkana(static_cast<unsigned char>(ch))) {
+                    out_buf[out_len++] = ch;
+                    continue;
+                } else if (ch >= 'a' && ch <= 'z') {
+                    out_buf[out_len++] = ch - 'a' + 'A';
+                    continue;
+                }
+            } else if (flag) {
                 out_buf[out_len++] = ch;
-                flag = true;
+                flag = false;
                 continue;
-            } else if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || allowed_special.contains(ch) || ishalfkana(static_cast<unsigned char>(ch))) {
+            }
+        } else {
+            if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || allowed_special.contains(ch)) {
                 out_buf[out_len++] = ch;
                 continue;
-            } else if (ch >= 'a' && ch <= 'z') {
+            }
+            if (ch >= 'a' && ch <= 'z') {
                 out_buf[out_len++] = ch - 'a' + 'A';
                 continue;
             }
-        } else if(flag) {
-            out_buf[out_len++] = ch;
-            flag = false;
-            continue;
-        }
-#else
-        if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || allowed_special.contains(ch)) {
-            out_buf[out_len++] = ch;
-            continue;
-        }
-        if (ch >= 'a' && ch <= 'z') {
-            out_buf[out_len++] = ch - 'a' + 'A';
-            continue;
-        }
 
-        // Spaces are allowed, but trailing spaces in the base name or extension
-        // are considered padding and are not part of the file name.
-        if (ch == ' ' && idx < last_non_space_idx) {
-            out_buf[out_len++] = ch;
-            continue;
+            // Spaces are allowed, but trailing spaces in the base name or extension
+            // are considered padding and are not part of the file name.
+            if (ch == ' ' && idx < last_non_space_idx) {
+                out_buf[out_len++] = ch;
+                continue;
+            }
+
+            // Replace disallowed characters with '_'
+            out_buf[out_len++] = '_';
         }
-#endif
-        // Replace disallowed characters with '_'
-        out_buf[out_len++] = '_';
     }
 
     // pad with spaces
     while (out_len < buf_size) {
         out_buf[--buf_size] = ' ';
     }
+
     return {out_len, false};
 }
 
@@ -944,11 +1159,11 @@ bool file_name_to_83(
         const unsigned int counter_len = counter > 999 ? 4 : (counter > 99 ? 3 : (counter > 9 ? 2 : 1));
         if (base_len + counter_len > sizeof(fcb_name.name_blank_padded) - 1) {
             base_len = sizeof(fcb_name.name_blank_padded) - 1 - counter_len;
-#ifdef SHIFT_JIS
-            if(iskanji_position(fcb_name.name_blank_padded, base_len)) {
-                base_len--;
+            if (use_shiftjis()) {
+                if (iskanji_position(fcb_name.name_blank_padded, base_len)) {
+                    base_len--;
+                }
             }
-#endif
         }
 
         name_blank_padded[base_len] = '~';
@@ -970,9 +1185,6 @@ uint8_t get_path_dos_properties(
     const std::filesystem::path & path, DosFileProperties * properties, [[maybe_unused]] AttrsMode mode) {
     std::error_code ec;
     uint8_t attrs = std::filesystem::is_directory(path, ec) ? FAT_DIRECTORY : 0;
-    if (ec) {
-        return FAT_ERROR_ATTR;  // error (probably doesn't exist)
-    }
 
     if (properties) {
         // set file fcbname to the file part of path (ignore traling directory separators)
@@ -1029,6 +1241,11 @@ void set_item_attrs(
     [[maybe_unused]] const std::filesystem::path & path,
     [[maybe_unused]] uint8_t attrs,
     [[maybe_unused]] AttrsMode mode) {
+    if (is_dangling_symlink(path)) {
+        throw FilesystemError(
+            "set_item_attrs: Access denied: Dangling symlink: " + path.string(), DOS_EXTERR_ACCESS_DENIED);
+    }
+
 #if DOS_ATTRS_NATIVE == 1
     if (mode == AttrsMode::NATIVE) {
         set_dos_attrs_native(path, attrs);
@@ -1044,6 +1261,10 @@ void set_item_attrs(
 
 
 uint8_t get_item_attrs([[maybe_unused]] const std::filesystem::path & path, [[maybe_unused]] AttrsMode mode) {
+    if (is_dangling_symlink(path)) {
+        return 0;
+    }
+
 #if DOS_ATTRS_NATIVE == 1
     if (mode == AttrsMode::NATIVE) {
         return get_dos_attrs_native(path);
@@ -1061,27 +1282,44 @@ uint8_t get_item_attrs([[maybe_unused]] const std::filesystem::path & path, [[ma
 
 
 void make_dir(const std::filesystem::path & dir) {
+    if (is_dangling_symlink(dir)) {
+        throw FilesystemError("make_dir: Dangling symlink - not directory: " + dir.string(), DOS_EXTERR_ACCESS_DENIED);
+    }
     if (!std::filesystem::create_directory(dir)) {
-        throw std::runtime_error("make_dir: Directory exists: " + dir.string());
+        throw FilesystemError("make_dir: Directory exists: " + dir.string(), DOS_EXTERR_ACCESS_DENIED);
     }
 }
 
 
 void delete_dir(const std::filesystem::path & dir) {
+    if (is_dangling_symlink(dir)) {
+        throw FilesystemError(
+            "delete_dir: Dangling symlink - not directory: " + dir.string(), DOS_EXTERR_ACCESS_DENIED);
+    }
     if (!std::filesystem::exists(dir)) {
-        throw std::runtime_error("delete_dir: Directory does not exist: " + dir.string());
+        throw FilesystemError("delete_dir: Directory does not exist: " + dir.string(), DOS_EXTERR_PATH_NOT_FOUND);
     }
     if (!std::filesystem::is_directory(dir)) {
-        throw std::runtime_error("delete_dir: Not a directory: " + dir.string());
+        throw FilesystemError("delete_dir: Not a directory: " + dir.string(), DOS_EXTERR_ACCESS_DENIED);
     }
     std::filesystem::remove(dir);
 }
 
 
-void change_dir(const std::filesystem::path & dir) { std::filesystem::current_path(dir); }
+void change_dir(const std::filesystem::path & dir) {
+    if (is_dangling_symlink(dir)) {
+        throw FilesystemError(
+            "change_dir: Dangling symlink - not directory: " + dir.string(), DOS_EXTERR_PATH_NOT_FOUND);
+    }
+    std::filesystem::current_path(dir);
+}
 
 
 DosFileProperties create_or_truncate_file(const std::filesystem::path & path, uint8_t attrs, AttrsMode mode) {
+    if (is_dangling_symlink(path)) {
+        throw FilesystemError("create_or_truncate_file: Dangling symlink: " + path.string(), DOS_EXTERR_ACCESS_DENIED);
+    }
+
     // try to create/truncate the file
 #ifdef _WIN32
     auto * const fd = _wfopen(path.c_str(), L"wb");
@@ -1089,7 +1327,7 @@ DosFileProperties create_or_truncate_file(const std::filesystem::path & path, ui
     auto * const fd = fopen(path.c_str(), "wb");
 #endif
     if (!fd) {
-        throw std::runtime_error(std::format("Cannot open file: {}", strerror(errno)));
+        throw FilesystemError(std::format("Cannot open file: {}", strerror(errno)), DOS_EXTERR_ACCESS_DENIED);
     }
     fclose(fd);
 
@@ -1112,6 +1350,35 @@ DosFileProperties create_or_truncate_file(const std::filesystem::path & path, ui
 }
 
 
+void try_open_file(const std::filesystem::path & path, uint8_t open_mode) {
+    if (is_dangling_symlink(path)) {
+        throw FilesystemError("try_open_file: Dangling symlink: " + path.string(), DOS_EXTERR_ACCESS_DENIED);
+    }
+
+    std::ios::openmode mode;
+    switch (open_mode & 0x03) {  // use only access mode bits, ignore sharing mode
+        case OPEN_MODE_RDONLY:
+            mode = std::ios::in | std::ios::binary;
+            break;
+        case OPEN_MODE_WRONLY:
+            mode = std::ios::in | std::ios::out | std::ios::binary;
+            break;
+        case OPEN_MODE_RDWR:
+            mode = std::ios::in | std::ios::out | std::ios::binary;
+            break;
+        default:
+            throw FilesystemError(
+                std::format("try_open_file: Invalid open mode 0x{:02X}", open_mode), DOS_EXTERR_FUNC_NUM_INVALID);
+    }
+
+    std::fstream file(path, mode);
+
+    if (!file.is_open()) {
+        throw FilesystemError("try_open_file: Cannot open file", DOS_EXTERR_ACCESS_DENIED);
+    }
+}
+
+
 void resize_file(const std::filesystem::path & path, uint32_t new_size) {
 #if defined(__cpp_lib_filesystem) && (__cpp_lib_filesystem >= 202002L)
     // Use C++23 std::filesystem::resize_file if available
@@ -1119,24 +1386,25 @@ void resize_file(const std::filesystem::path & path, uint32_t new_size) {
         std::filesystem::resize_file(path, new_size);
         return;
     } catch (const std::filesystem::filesystem_error &) {
-        throw std::runtime_error(std::format("Cannot resize file: {}", strerror(errno)));
+        throw FilesystemError(std::format("Cannot resize file: {}", strerror(errno)), DOS_EXTERR_ACCESS_DENIED);
     }
 #else
     // Fallback to platform-specific implementation
 #ifdef _WIN32
     FILE * const f = _wfopen(path.c_str(), L"r+b");
     if (!f) {
-        throw std::runtime_error(std::format("Cannot open file for resize: {}", strerror(errno)));
+        throw FilesystemError(
+            std::format("Cannot open file for resize: {}", strerror(errno)), DOS_EXTERR_ACCESS_DENIED);
     }
     const int fd = _fileno(f);
     const auto err = _chsize_s(fd, new_size);
     fclose(f);
     if (err != 0) {
-        throw std::runtime_error(std::format("Cannot resize file: {}", strerror(err)));
+        throw FilesystemError(std::format("Cannot resize file: {}", strerror(err)), DOS_EXTERR_ACCESS_DENIED);
     }
 #else
     if (truncate(path.string().c_str(), new_size) != 0) {
-        throw std::runtime_error(std::format("Cannot resize file: {}", strerror(errno)));
+        throw FilesystemError(std::format("Cannot resize file: {}", strerror(errno)), DOS_EXTERR_ACCESS_DENIED);
     }
 #endif
 #endif
@@ -1144,23 +1412,18 @@ void resize_file(const std::filesystem::path & path, uint32_t new_size) {
 
 
 void delete_file(const std::filesystem::path & file) {
-    if (!std::filesystem::exists(file)) {
-        throw FilesystemError("delete_files: File does not exist: " + file.string(), DOS_EXTERR_FILE_NOT_FOUND);
+    if (!std::filesystem::exists(file) && !std::filesystem::is_symlink(file)) {
+        throw FilesystemError("delete_file: File does not exist: " + file.string(), DOS_EXTERR_FILE_NOT_FOUND);
     }
     if (std::filesystem::is_directory(file)) {
-        throw FilesystemError("delete_files: Is a directory: " + file.string(), DOS_EXTERR_FILE_NOT_FOUND);
+        throw FilesystemError("delete_file: Is a directory: " + file.string(), DOS_EXTERR_ACCESS_DENIED);
     }
     std::filesystem::remove(file);
 }
 
 
 void rename_file(const std::filesystem::path & old_name, const std::filesystem::path & new_name) {
-    std::error_code ec;
-    std::filesystem::rename(old_name, new_name, ec);
-    if (ec) {
-        throw std::runtime_error(
-            "rename_file: Cannot rename " + old_name.string() + " to " + new_name.string() + ": " + ec.message());
-    }
+    std::filesystem::rename(old_name, new_name);
 }
 
 

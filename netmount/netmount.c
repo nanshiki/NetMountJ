@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Copyright 2024-2025 Jaroslav Rohel, jaroslav.rohel@gmail.com
+// Copyright 2024-2026 Jaroslav Rohel, jaroslav.rohel@gmail.com
 
 #include "../shared/dos.h"
 #include "../shared/drvproto.h"
@@ -11,17 +11,17 @@
 
 #include <stdint.h>
 
-#ifdef PC98
-#define TICK_ADDRESS    0x4F1
-#define TICK_HZ10       320
-#define TICK_HZ         32
-#else
-#define TICK_ADDRESS    0x46C
-#define TICK_HZ10       182
-#define TICK_HZ         18
-#endif
+#define NETMOUNT_VERSION "1.7.1J"
 
-#define NETMOUNT_VERSION "1.7.0"
+#ifdef PC98
+#define TICK_ADDRESS 0x4F1
+#define TICK_HZ10    320
+#define TICK_HZ      32
+#else
+#define TICK_ADDRESS 0x46C
+#define TICK_HZ10    182
+#define TICK_HZ      18
+#endif
 
 
 #pragma pack(1)
@@ -583,8 +583,7 @@ static void __declspec(naked) pktdrv_recv(void) {
 }
 
 #ifdef PC98
-static void __declspec(naked) timer98_func()
-{
+static void __declspec(naked) timer98_func() {
     __asm {
         mov byte ptr cs:global_timer98_flag, 1
         iret
@@ -592,8 +591,7 @@ static void __declspec(naked) timer98_func()
 }
 
 // Call timer_func() after count*10ms has elapsed.
-void start_timer98(uint16_t count)
-{
+void start_timer98(uint16_t count) {
     __asm {
         push es
 
@@ -733,7 +731,7 @@ static uint16_t send_request(
     snd_drive_proto->drive = drive;
     snd_drive_proto->function = function;  // AL value (function)
     if (drv_info->enabled_checksums & CHECKSUM_NETMOUNT_PROTO) {
-        snd_drive_proto->length_flags |= 0x8000U;  // switch checksum on
+        snd_drive_proto->length_flags |= FLAGS_CHECKSUM;  // switch checksum on
         snd_drive_proto->checksum = bsd_checksum(
             (uint8_t *)(&snd_drive_proto->checksum + 1),
             len - ((uint8_t *)(&snd_drive_proto->checksum + 1) - (uint8_t *)snd_drive_proto));
@@ -787,7 +785,7 @@ static uint16_t send_request(
             }
 
             // validate frame length (if provided)
-            const uint16_t len = rcv_drive_proto->length_flags & 0x07FFU;
+            const uint16_t len = rcv_drive_proto->length_flags & LENGTH_MASK;
             if (len > *recvrequest_data_len_ptr) {
                 // frame appears to be truncated
                 goto ignore_frame;
@@ -804,7 +802,13 @@ static uint16_t send_request(
                 goto ignore_frame;
             }
 
-            if (rcv_drive_proto->length_flags & 0x8000U) {
+            if (rcv_drive_proto->length_flags & FLAGS_DATETIME) {
+                ((struct drive_info * const)drv_info)->enabled_checksums |= ENABLE_DATETIME;
+            } else {
+                ((struct drive_info * const)drv_info)->enabled_checksums &= ~ENABLE_DATETIME;
+            }
+
+            if (rcv_drive_proto->length_flags & FLAGS_CHECKSUM) {
                 // the received data contains a checksum
                 // if enabled, check the received checksum
                 if ((drv_info->enabled_checksums & CHECKSUM_NETMOUNT_PROTO) &&
@@ -956,8 +960,15 @@ static void handle_request_for_our_drive(void) {
             }
 
             struct drive_proto_closef * const args = (struct drive_proto_closef * const)buff;
+            struct drive_info const * const drv_info = &getptr_shared_data()->drives[reqdrv];
             args->start_cluster = sftptr->start_cluster;
-            if (send_request(subfunction, reqdrv, sizeof(*args), &reply, &ax) == 0) {
+            uint16_t length = sizeof(*args);
+            if ((drv_info->enabled_checksums & ENABLE_DATETIME) && sftptr->start_file_time != sftptr->file_time) {
+                args->date_time = sftptr->file_time;
+            } else {
+                length -= sizeof(uint32_t);
+            }
+            if (send_request(subfunction, reqdrv, length, &reply, &ax) == 0) {
                 if (ax != 0) {
                     set_error(r, ax);
                 }
@@ -1127,12 +1138,21 @@ static void handle_request_for_our_drive(void) {
                 break;
             }
 
-            // invalidate the read buffer if writing to the buffered area of the file
+            // invalidate the read buffer if a write overlaps the buffered region of the file
             if (read_buffer->valid_bytes > 0 && read_buffer->drive_no == reqdrv &&
                 read_buffer->start_cluster == sftptr->start_cluster) {
-                if ((sftptr->file_pos < read_buffer->offset + read_buffer->valid_bytes) &&
-                    (sftptr->file_pos + r->w.cx > read_buffer->offset)) {
-                    read_buffer->valid_bytes = 0;
+                // write affects the currently buffered file
+                if (sftptr->file_pos < read_buffer->offset + read_buffer->valid_bytes) {
+                    // write starts before the end of the buffered region
+                    if (r->w.cx == 0) {
+                        // A zero-length write means "truncate at current offset"
+                        // -> buffered data is no longer valid
+                        read_buffer->valid_bytes = 0;
+                    } else if (sftptr->file_pos + r->w.cx > read_buffer->offset) {
+                        // Write overlaps buffered data
+                        // -> buffered data is no longer valid
+                        read_buffer->valid_bytes = 0;
+                    }
                 }
             }
 
@@ -1397,9 +1417,19 @@ static void handle_request_for_our_drive(void) {
                 struct dos_sft __far * const sft_ptr = MK_FP(r->w.es, r->w.di);
                 struct drive_proto_open_create_reply const * const args =
                     (struct drive_proto_open_create_reply const * const)reply;
+
+                if (subfunction == INT2F_CREATE_FILE ||
+                    (subfunction == INT2F_EXTENDED_OPEN_CREATE_FILE &&
+                     args->result_code == DOS_EXT_OPEN_FILE_RESULT_CODE_TRUNCATED) &&
+                        read_buffer->drive_no == reqdrv && read_buffer->start_cluster == args->start_cluster) {
+                    // invalidate the read buffer when it holds data from a truncated file
+                    read_buffer->valid_bytes = 0;
+                }
+
                 if (subfunction == INT2F_EXTENDED_OPEN_CREATE_FILE) {
                     r->w.cx = args->result_code;
                 }
+
                 if (sft_ptr->open_mode &
                     0x8000U) {  // EtherDFS: if bit 15 is set, then it's a "FCB open", and requires the internal DOS
                                 // "Set FCB Owner" function to be called: TODO FIXME set_sft_owner()
@@ -1413,8 +1443,7 @@ static void handle_request_for_our_drive(void) {
                 sft_ptr->file_pos = 0;
                 sft_ptr->open_mode &= 0xFF00U;
                 sft_ptr->open_mode |= args->mode;
-                sft_ptr->rel_sector = 0xFFFFU;
-                sft_ptr->abs_sector = 0xFFFFU;
+                sft_ptr->start_file_time = args->date_time;
                 sft_ptr->dir_sector = 0;
                 sft_ptr->dir_entry_no = 0xFF;  // why such value? no idea, EtherDFS says PHANTON.C uses that
                 sft_ptr->file_name = args->name;
@@ -2446,7 +2475,7 @@ static int umount(struct shared_data __far * shared_data_ptr, uint8_t drive_no) 
 static void print_help(void) {
     my_print_dos_string(
         "NetMount " NETMOUNT_VERSION
-        ", Copyright 2024-2025 Jaroslav Rohel <jaroslav.rohel@gmail.com>\r\n"
+        ", Copyright 2024-2026 Jaroslav Rohel <jaroslav.rohel@gmail.com>\r\n"
 #ifdef PC98
  #ifdef DOS3
         "         for PC-9801 MS-DOS 3.1/3.3\r\n"
@@ -2513,7 +2542,7 @@ int main(int argc, char * argv[]) {
 #ifdef DOS3
     if (dos_ver.major != 3) {
 #else
-    if (dos_ver.major < 5) {
+    if (dos_ver.major < 4) {
 #endif
         int major = dos_ver.major + 0x30;
         int minor = ((dos_ver.minor >= 10) ? dos_ver.minor / 10 : dos_ver.minor) + 0x30;

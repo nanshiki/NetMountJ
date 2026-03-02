@@ -17,12 +17,17 @@ In addition to these core components, the NetMount project includes supporting u
 ## Japanese edition (日本語環境対応版)
 
 Japanese filenames are converted to Shift JIS on the server side, enabling display and read/write operations for Japanese filenames on PC-9801/PC-9821 and DOS/V.  
+When the server starts, specifying the --translit-map-path option loads netmount-u2a.map and converts the character encoding. Specifying --translit-map-path=file loads file and converts the character encoding.  
+If these options are not specified, the character encoding is converted to Shift JIS.  
 PC-9801/PC-9821 timer-compatible client version has also been created.  
-Please note that building from this source will only generate the Shift JIS server version and the PC-9801/PC-9821 client version.  
+Added support for setting the date and time of files on remote drives. This means that date and time information will also be copied when copying files.  
+Since the client side also needs to be compatible with date and time information, we now also provide binaries for the IBM PC(DOS/V) version.
 
 日本語のファイル名をサーバー側でShift JISに変換するので、PC-9801/PC-9821やDOS/Vで日本語ファイル名の表示や読み書きが可能となります。  
+サーバー起動時にオプション--translit-map-pathを指定するとnetmount-u2a.mapを読み込み文字コードを変換します。--translit-map-path=fileを指定するとfileを読み込み文字コードを変換します。これらのオプションを指定しない場合文字コードをShift JISに変換します。  
 クライアントのPC-9801/PC-9821タイマー対応版も作成しています。  
-ここのソースでビルドするとサーバーはShift JIS対応版、クライアントはPC-9801/PC9821対応版のみ生成されますのでご注意ください。  
+リモートドライブ上のファイルの日時設定に対応しています。これによりファイルコピーで日時情報もコピーされるようになります。  
+日時情報はクライアント側も対応版にする必要があるため、IBM PC(DOS/V)版のバイナリも提供するようにしました。  
 
 -----
 ## `netmount` (DOS Client)
@@ -106,8 +111,8 @@ Arguments:
 ./netmount-server [--help] [--bind-addr=<IP_ADDR>] [--bind-port=<UDP_PORT]
 [--slip-dev=<SERIAL_DEVICE> --slip-speed=<BAUD_RATE>] [--slip-rts-cts=<ENABLED>]
 [--translit-map-path=<PATH>] [--log-level=<LEVEL>]
-<drive>=<root_path>[,attrs=<storage_method>][,label=<volume_label>][,name_conversion=<method>]
-[... <drive>=<root_path>[,label=<volume_label>][,name_conversion=<method>]]
+<drive>=<root_path>[,attrs=<storage_method>][,label=<volume_label>][,name_conversion=<method>][,readonly=<MODE>]
+[... <drive>=<root_path>[,label=<volume_label>][,name_conversion=<method>][,readonly=<MODE>]]
 
 Options:
   --help                      Display this help
@@ -122,6 +127,7 @@ Options:
   attrs=<storage_method>      File attribute storage method: AUTO, IGNORE, NATIVE, EXTENDED (default: AUTO)
   label=<volume_label>        volume label (first 11 chars used, default: NETMOUNT; use "--label=" to remove)
   name_conversion=<method>    file name conversion method: OFF, RAM (default: RAM)
+  readonly=<MODE>             enable read-only sharing: 0 = writable, 1 = read-only (default: writable)
 ```
 
 [More info about the server](SERVER.md)

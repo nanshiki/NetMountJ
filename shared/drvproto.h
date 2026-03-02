@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Copyright 2024 Jaroslav Rohel, jaroslav.rohel@gmail.com
+// Copyright 2024-2026 Jaroslav Rohel, jaroslav.rohel@gmail.com
 
 #ifndef _DRVPROTO_H_
 #define _DRVPROTO_H_
@@ -15,10 +15,17 @@
 #define DRIVE_PROTO_MAGIC    0x9524U
 #define DRIVE_PROTO_UDP_PORT 12200
 
+#define FLAGS_CHECKSUM_BIT   15
+#define FLAGS_CHECKSUM       0x8000U
+#define FLAGS_CHECKSUM_OFF   0x7FFFU
+#define FLAGS_READONLY       0x4000U
+#define FLAGS_DATETIME       0x1000U
+#define LENGTH_MASK          0x07FFU
+
 // little endian
 struct drive_proto_hdr {
     uint8_t version;
-    uint16_t length_flags;  // chechsum_used | unused | unused | unused | unused | length
+    uint16_t length_flags;  // chechsum_used | read-only share | unused | unused | unused | length
     uint16_t checksum;
     uint8_t sequence;
     union {
@@ -36,6 +43,7 @@ struct drive_proto_hdr {
 
 struct drive_proto_closef {
     uint16_t start_cluster;
+    uint32_t date_time;
 };
 
 

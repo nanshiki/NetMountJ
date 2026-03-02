@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Copyright 2025 Jaroslav Rohel, jaroslav.rohel@gmail.com
+// Copyright 2025-2026 Jaroslav Rohel, jaroslav.rohel@gmail.com
 
 #include "../shared/dos.h"
 #include "../shared/drvproto.h"
@@ -25,9 +25,9 @@
 #include <string_view>
 
 #ifdef SHIFT_JIS
-#define PROGRAM_VERSION "1.6.0J2"
+#define PROGRAM_VERSION "1.7.0J"
 #else
-#define PROGRAM_VERSION "1.6.0"
+#define PROGRAM_VERSION "1.7.0"
 #endif
 
 // structs are packed
@@ -136,12 +136,88 @@ std::filesystem::path create_relative_path(const void * buff, uint16_t len) {
     auto * ptr = reinterpret_cast<const char *>(buff);
 
     std::string search_template(ptr, len);
-#ifdef SHIFT_JIS
-    search_template = sjis_to_utf8(search_template);
-#endif
+    if (use_shiftjis()) {
+        search_template = sjis_to_utf8(search_template);
+    }
     std::transform(search_template.begin(), search_template.end(), search_template.begin(), ascii_to_lower);
     std::replace(search_template.begin(), search_template.end(), '\\', '/');
     return std::filesystem::path(search_template).relative_path();
+}
+
+
+uint16_t get_dos_err_code(const std::runtime_error & ex, uint16_t default_dos_err_code) {
+    if (const auto filesystem_error = dynamic_cast<const FilesystemError *>(&ex)) {
+        default_dos_err_code = filesystem_error->get_dos_err_code();
+    }
+
+    if (const auto std_fs_error = dynamic_cast<const std::filesystem::filesystem_error *>(&ex)) {
+        if (std_fs_error->code() == std::errc::directory_not_empty) {
+            default_dos_err_code = DOS_EXTERR_ACCESS_DENIED;
+        } else if (std_fs_error->code() == std::errc::file_exists) {
+            default_dos_err_code = DOS_EXTERR_ACCESS_DENIED;
+        } else if (std_fs_error->code() == std::errc::is_a_directory) {
+            default_dos_err_code = DOS_EXTERR_ACCESS_DENIED;
+        } else if (std_fs_error->code() == std::errc::io_error) {
+            default_dos_err_code = DOS_EXTERR_ACCESS_DENIED;
+        } else if (std_fs_error->code() == std::errc::no_such_file_or_directory) {
+            default_dos_err_code = DOS_EXTERR_FILE_NOT_FOUND;
+        } else if (std_fs_error->code() == std::errc::not_a_directory) {
+            default_dos_err_code = DOS_EXTERR_ACCESS_DENIED;
+        } else if (std_fs_error->code() == std::errc::permission_denied) {
+            default_dos_err_code = DOS_EXTERR_ACCESS_DENIED;
+        } else if (std_fs_error->code() == std::errc::read_only_file_system) {
+            default_dos_err_code = DOS_EXTERR_ACCESS_DENIED;
+        }
+    }
+
+    return default_dos_err_code;
+}
+
+
+// Logs exception and returns DOS error code
+uint16_t log_exception_get_dos_err_code(
+    const char * function,
+    unsigned int drive,
+    const std::filesystem::path & path,
+    uint16_t default_dos_err_code,
+    const std::runtime_error & ex) {
+
+    default_dos_err_code = get_dos_err_code(ex, default_dos_err_code);
+    log(LogLevel::WARNING,
+        "{} \"{:c}:\\{}\": ({}) {}\n",
+        function,
+        drive + 'A',
+#if defined(_WIN32) && defined(SHIFT_JIS)
+        utf8_to_sjis(path.string()),
+#else
+        path.string(),
+#endif
+        default_dos_err_code,
+        ex.what());
+
+    return default_dos_err_code;
+}
+
+
+// Logs exception and returns DOS error code
+uint16_t log_exception_get_dos_err_code(
+    const char * function,
+    unsigned int drive,
+    uint16_t handle,
+    uint16_t default_dos_err_code,
+    const std::runtime_error & ex) {
+
+    default_dos_err_code = get_dos_err_code(ex, default_dos_err_code);
+
+    log(LogLevel::WARNING,
+        "{} drive {:c} handle {}: ({}) {}\n",
+        function,
+        drive + 'A',
+        handle,
+        default_dos_err_code,
+        ex.what());
+
+    return default_dos_err_code;
 }
 
 
@@ -180,7 +256,6 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
 
     const unsigned int reqdrv = request_header->drive & 0x1F;
     const int function = request_header->function;
-    uint16_t * const ax = &reply_header->ax;
     int reply_packet_len = 0;
 
     if ((reqdrv < 2) || (reqdrv >= drives.size())) {
@@ -196,7 +271,7 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
     }
 
     // assume success
-    *ax = to_little16(DOS_EXTERR_NO_ERROR);
+    uint16_t return_code = DOS_EXTERR_NO_ERROR;
 
     log(LogLevel::TRACE,
         "Got query: 0x{:02X} [{:02X} {:02X} {:02X} {:02X}]\n",
@@ -214,30 +289,29 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
             }
             const auto relative_path = create_relative_path(request_data, request_data_len);
 
-            if (function == INT2F_MAKE_DIR) {
-                log(LogLevel::DEBUG, "MAKE_DIR \"{:c}:\\{}\"\n", reqdrv + 'A', relative_path.string());
-                try {
+            try {
+                if (function == INT2F_MAKE_DIR) {
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                    log(LogLevel::DEBUG, "MAKE_DIR \"{:c}:\\{}\"\n", reqdrv + 'A', utf8_to_sjis(relative_path.string()));
+#else
+                    log(LogLevel::DEBUG, "MAKE_DIR \"{:c}:\\{}\"\n", reqdrv + 'A', relative_path.string());
+#endif
                     drive.make_dir(relative_path);
-                } catch (const std::runtime_error & ex) {
-                    *ax = to_little16(DOS_EXTERR_WRITE_FAULT);
-                    log(LogLevel::WARNING,
-                        "MAKE_DIR \"{:c}:\\{}\": {}\n",
-                        reqdrv + 'A',
-                        relative_path.string(),
-                        ex.what());
-                }
-            } else {
-                log(LogLevel::DEBUG, "REMOVE_DIR \"{:c}:\\{}\"\n", reqdrv + 'A', relative_path.string());
-                try {
+                } else {
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                    log(LogLevel::DEBUG, "REMOVE_DIR \"{:c}:\\{}\"\n", reqdrv + 'A', utf8_to_sjis(relative_path.string()));
+#else
+                    log(LogLevel::DEBUG, "REMOVE_DIR \"{:c}:\\{}\"\n", reqdrv + 'A', relative_path.string());
+#endif
                     drive.delete_dir(relative_path);
-                } catch (const std::runtime_error & ex) {
-                    *ax = to_little16(DOS_EXTERR_WRITE_FAULT);
-                    log(LogLevel::WARNING,
-                        "REMOVE_DIR \"{:c}:\\{}\": {}\n",
-                        reqdrv + 'A',
-                        relative_path.string(),
-                        ex.what());
                 }
+            } catch (const std::runtime_error & ex) {
+                return_code = log_exception_get_dos_err_code(
+                    function == INT2F_MAKE_DIR ? "MAKE_DIR" : "REMOVE_DIR",
+                    reqdrv,
+                    relative_path,
+                    DOS_EXTERR_PATH_NOT_FOUND,
+                    ex);
             }
         } break;
 
@@ -247,34 +321,41 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
             }
             const auto relative_path = create_relative_path(request_data, request_data_len);
 
+#if defined(_WIN32) && defined(SHIFT_JIS)
+            log(LogLevel::DEBUG, "CHANGE_DIR \"{:c}:\\{}\"\n", reqdrv + 'A', utf8_to_sjis(relative_path.string()));
+#else
             log(LogLevel::DEBUG, "CHANGE_DIR \"{:c}:\\{}\"\n", reqdrv + 'A', relative_path.string());
+#endif
             // Try to chdir to this dir
             try {
                 drive.change_dir(relative_path);
             } catch (const std::runtime_error & ex) {
-                log(LogLevel::WARNING,
-                    "CHANGE_DIR \"{:c}:\\{}\": {}\n",
-                    reqdrv + 'A',
-                    relative_path.string(),
-                    ex.what());
-                *ax = to_little16(DOS_EXTERR_PATH_NOT_FOUND);
+                return_code =
+                    log_exception_get_dos_err_code("CHANGE_DIR", reqdrv, relative_path, DOS_EXTERR_PATH_NOT_FOUND, ex);
             }
             break;
         }
 
         case INT2F_CLOSE_FILE: {
-            if (request_data_len != sizeof(drive_proto_closef)) {
+            auto * const request = reinterpret_cast<const drive_proto_closef *>(request_data);
+            uint32_t date_time = 0;
+            if (request_data_len == sizeof(drive_proto_closef)) {
+                date_time = from_little32(request->date_time);
+            } else if (request_data_len != sizeof(drive_proto_closef) - sizeof(uint32_t)) {
                 return -1;
             }
             // Only checking the existence of the handle because I don't keep files open.
-            auto * const request = reinterpret_cast<const drive_proto_closef *>(request_data);
             const uint16_t handle = from_little16(request->start_cluster);
-            log(LogLevel::DEBUG, "CLOSE_FILE handle {}\n", handle);
+            log(LogLevel::DEBUG, "CLOSE_FILE handle {} {:08X}\n", handle, date_time);
             try {
-                drive.get_handle_path(handle);
+                if (date_time != 0) {
+                    drive.set_file_date_time(handle, date_time);
+                } else {
+                    drive.get_handle_path(handle);
+                }
             } catch (const std::runtime_error & ex) {
-                log(LogLevel::WARNING, "CLOSE_FILE handle {}: {}\n", handle, ex.what());
                 // TODO: Send error to client?
+                return_code = log_exception_get_dos_err_code("CLOSE_FILE", reqdrv, handle, DOS_EXTERR_NO_ERROR, ex);
             }
         } break;
 
@@ -290,8 +371,7 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
             try {
                 reply_packet_len = drive.read_file(reply_data, handle, offset, len);
             } catch (const std::runtime_error & ex) {
-                log(LogLevel::WARNING, "READ_FILE handle {}: {}\n", handle, ex.what());
-                *ax = to_little16(DOS_EXTERR_ACCESS_DENIED);
+                return_code = log_exception_get_dos_err_code("READ_FILE", reqdrv, handle, DOS_EXTERR_ACCESS_DENIED, ex);
             }
         } break;
 
@@ -302,6 +382,7 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
             auto * const request = reinterpret_cast<const drive_proto_writef *>(request_data);
             const uint32_t offset = from_little32(request->offset);
             const uint16_t handle = from_little16(request->start_cluster);
+
             log(LogLevel::DEBUG,
                 "WRITE_FILE handle {}, {} bytes, offset {}\n",
                 handle,
@@ -317,8 +398,8 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
                 reply->written = to_little16(write_len);
                 reply_packet_len = sizeof(drive_proto_writef_reply);
             } catch (const std::runtime_error & ex) {
-                log(LogLevel::WARNING, "WRITE_FILE handle {}: {}\n", handle, ex.what());
-                *ax = to_little16(DOS_EXTERR_ACCESS_DENIED);
+                return_code =
+                    log_exception_get_dos_err_code("WRITE_FILE", reqdrv, handle, DOS_EXTERR_ACCESS_DENIED, ex);
             }
 
         } break;
@@ -335,8 +416,9 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
             try {
                 drive.get_handle_path(handle);
             } catch (const std::runtime_error & ex) {
-                log(LogLevel::ERROR, "LOCK_UNLOCK_FILE handle {}: {}\n", handle, ex.what());
                 // TODO: Send error to client?
+                return_code =
+                    log_exception_get_dos_err_code("LOCK_UNLOCK_FILE", reqdrv, handle, DOS_EXTERR_NO_ERROR, ex);
             }
         } break;
 
@@ -352,12 +434,15 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
             try {
                 drive.get_handle_path(handle);
             } catch (const std::runtime_error & ex) {
-                log(LogLevel::ERROR, "UNLOCK_FILE handle {}: {}\n", handle, ex.what());
                 // TODO: Send error to client?
+                return_code = log_exception_get_dos_err_code("UNLOCK_FILE", reqdrv, handle, DOS_EXTERR_NO_ERROR, ex);
             }
         } break;
 
         case INT2F_DISK_INFO: {
+            if (request_data_len != 0) {
+                return -1;
+            }
             log(LogLevel::DEBUG, "DISK_INFO for drive {:c}:\n", 'A' + reqdrv);
             try {
                 auto [fs_size, free_space] = drive.space_info();
@@ -369,15 +454,15 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
                 log(LogLevel::DEBUG, "  TOTAL: {} KiB ; FREE: {} KiB\n", fs_size >> 10, free_space >> 10);
                 // AX: media id (8 bits) | sectors per cluster (8 bits)
                 // etherdfs says: MSDOS tolerates only 1 here!
-                *ax = to_little16(1);
+                return_code = 1;
                 auto * const reply = reinterpret_cast<drive_proto_disk_info_reply *>(reply_data);
                 reply->total_clusters = to_little16(fs_size >> 15);  // 32K clusters
                 reply->bytes_per_sector = to_little16(32768);
                 reply->available_clusters = to_little16(free_space >> 15);  // 32K clusters
                 reply_packet_len = sizeof(drive_proto_disk_info_reply);
             } catch (const std::runtime_error & ex) {
-                log(LogLevel::WARNING, "DISK_INFO: for drive {:c}: {}\n", 'A' + reqdrv, ex.what());
-                return -1;
+                return_code = DOS_EXTERR_ACCESS_DENIED;
+                log(LogLevel::WARNING, "DISK_INFO drive {:c}: ({}) {}\n", reqdrv + 'A', return_code, ex.what());
             }
         } break;
 
@@ -392,18 +477,17 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
             log(LogLevel::DEBUG,
                 "SET_ATTRS file \"{:c}:\\{}\", attr: 0x{:02X}\n",
                 reqdrv + 'A',
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                utf8_to_sjis(relative_path.string()),
+#else
                 relative_path.string(),
+#endif
                 attrs);
             try {
                 drive.set_item_attrs(relative_path, attrs);
             } catch (const std::runtime_error & ex) {
-                log(LogLevel::ERROR,
-                    "SET_ATTRS failed to set 0x{:02X} to \"{:c}:\\{}\": {}\n",
-                    attrs,
-                    reqdrv + 'A',
-                    relative_path.string(),
-                    ex.what());
-                *ax = to_little16(DOS_EXTERR_FILE_NOT_FOUND);
+                return_code =
+                    log_exception_get_dos_err_code("SET_ATTRS", reqdrv, relative_path, DOS_EXTERR_FILE_NOT_FOUND, ex);
             }
         } break;
 
@@ -413,22 +497,22 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
             }
             const auto relative_path = create_relative_path(request_data, request_data_len);
 
+#if defined(_WIN32) && defined(SHIFT_JIS)
+            log(LogLevel::DEBUG, "GET_ATTRS file \"{:c}:\\{}\"\n", reqdrv + 'A', utf8_to_sjis(relative_path.string()));
+#else
             log(LogLevel::DEBUG, "GET_ATTRS file \"{:c}:\\{}\"\n", reqdrv + 'A', relative_path.string());
+#endif
             DosFileProperties properties;
-            uint8_t attrs;
             try {
-                attrs = drive.get_dos_properties(relative_path, &properties);
-            } catch (const std::runtime_error &) {
-                attrs = FAT_ERROR_ATTR;
-            }
-            if (attrs == FAT_ERROR_ATTR) {
-                log(LogLevel::NOTICE, "GET_ATTRS file not found \"{:c}:\\{}\"\n", reqdrv + 'A', relative_path.string());
-                *ax = to_little16(DOS_EXTERR_FILE_NOT_FOUND);
-            } else {
+                drive.get_dos_properties(relative_path, &properties);
                 log(LogLevel::DEBUG,
                     "GET_ATTRS \"{:c}:\\{}\" size {} bytes, attr 0x{:02X}\n",
                     reqdrv + 'A',
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                    utf8_to_sjis(relative_path.string()),
+#else
                     relative_path.string(),
+#endif
                     properties.size,
                     properties.attrs);
                 auto * const reply = reinterpret_cast<drive_proto_get_attrs_reply *>(reply_data);
@@ -438,41 +522,60 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
                 reply->size_hi = to_little16(properties.size >> 16);
                 reply->attrs = properties.attrs;
                 reply_packet_len = sizeof(drive_proto_get_attrs_reply);
+            } catch (const std::runtime_error & ex) {
+                return_code =
+                    log_exception_get_dos_err_code("GET_ATTRS", reqdrv, relative_path, DOS_EXTERR_FILE_NOT_FOUND, ex);
             }
         } break;
 
         case INT2F_RENAME_FILE: {
-            // At least 3 bytes, expected two paths, one is zero terminated
+            // At least 3 bytes, expected two paths, first has length prefix
             if (request_data_len < 3) {
                 return -1;
             }
             const int path1_len = request_data[0];
+            if (request_data_len <= path1_len + 1) {
+                // missing path2
+                return -1;
+            }
             const int path2_len = request_data_len - (1 + path1_len);
-            if (request_data_len > path1_len) {
-                const auto old_relative_path = create_relative_path(request_data + 1, path1_len);
-                const auto new_relative_path = create_relative_path(request_data + 1 + path1_len, path2_len);
+            const auto old_relative_path = create_relative_path(request_data + 1, path1_len);
+            const auto new_relative_path = create_relative_path(request_data + 1 + path1_len, path2_len);
 
-                log(LogLevel::DEBUG,
-                    "RENAME_FILE: \"{:c}:\\{}\" -> \"{:c}:\\{}\"\n",
+            log(LogLevel::DEBUG,
+                "RENAME_FILE: \"{:c}:\\{}\" -> \"{:c}:\\{}\"\n",
+                reqdrv + 'A',
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                utf8_to_sjis(old_relative_path.string()),
+#else
+                old_relative_path.string(),
+#endif
+                reqdrv + 'A',
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                utf8_to_sjis(new_relative_path.string()));
+#else
+                new_relative_path.string());
+#endif
+            try {
+                drive.rename_file(old_relative_path, new_relative_path);
+            } catch (const std::runtime_error & ex) {
+                return_code = get_dos_err_code(ex, DOS_EXTERR_ACCESS_DENIED);
+                log(LogLevel::WARNING,
+                    "RENAME_FILE \"{:c}:\\{}\" -> \"{:c}:\\{}\": ({}) {}\n",
                     reqdrv + 'A',
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                    utf8_to_sjis(old_relative_path.string()),
+#else
                     old_relative_path.string(),
+#endif
                     reqdrv + 'A',
-                    new_relative_path.string());
-
-                try {
-                    drive.rename_file(old_relative_path, new_relative_path);
-                } catch (const std::runtime_error & ex) {
-                    log(LogLevel::WARNING,
-                        "RENAME_FILE: \"{:c}:\\{}\" -> \"{:c}:\\{}\": {}\n",
-                        reqdrv + 'A',
-                        old_relative_path.string(),
-                        reqdrv + 'A',
-                        new_relative_path.string(),
-                        ex.what());
-                    *ax = to_little16(DOS_EXTERR_ACCESS_DENIED);
-                }
-            } else {
-                *ax = to_little16(DOS_EXTERR_FILE_NOT_FOUND);
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                    utf8_to_sjis(new_relative_path.string()),
+#else
+                    new_relative_path.string(),
+#endif
+                    return_code,
+                    ex.what());
             }
         } break;
 
@@ -481,16 +584,17 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
                 return -1;
             }
             const auto relative_path = create_relative_path(request_data, request_data_len);
+
+#if defined(_WIN32) && defined(SHIFT_JIS)
+            log(LogLevel::DEBUG, "DELETE_FILE \"{:c}:\\{}\"\n", reqdrv + 'A', utf8_to_sjis(relative_path.string()));
+#else
             log(LogLevel::DEBUG, "DELETE_FILE \"{:c}:\\{}\"\n", reqdrv + 'A', relative_path.string());
+#endif
             try {
                 drive.delete_files(relative_path);
-            } catch (const FilesystemError & ex) {
-                log(LogLevel::WARNING,
-                    "DELETE_FILE \"{:c}:\\{}\": {}\n",
-                    reqdrv + 'A',
-                    relative_path.string(),
-                    ex.what());
-                *ax = to_little16(ex.get_dos_err_code());
+            } catch (const std::runtime_error & ex) {
+                return_code =
+                    log_exception_get_dos_err_code("DELETE_FILE", reqdrv, relative_path, DOS_EXTERR_FILE_NOT_FOUND, ex);
             }
         } break;
 
@@ -507,7 +611,11 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
             log(LogLevel::DEBUG,
                 "FIND_FIRST in \"{:c}:\\{}\"\n filemask: \"{}\"\n attrs: 0x{:2X}\n",
                 reqdrv + 'A',
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                utf8_to_sjis(search_template_parent.string()),
+#else
                 search_template_parent.string(),
+#endif
                 filemask,
                 fattr);
 
@@ -515,31 +623,29 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
 
             uint16_t handle;
             try {
-                const auto [server_directory, exist] = drive.create_server_path(search_template_parent);
-                if (!exist) {
-                    log(LogLevel::NOTICE, "FIND_FIRST Directory does not exist: {}\n", search_template_parent.string());
-                    // do not use DOS_EXTERR_FILE_NOT_FOUND, some applications rely on a failing FIND_FIRST
-                    // to return DOS_EXTERR_NO_MORE_FILES (e.g. LapLink 5)
-                    *ax = to_little16(DOS_EXTERR_NO_MORE_FILES);
-                    break;
-                }
-                handle = drive.get_handle(server_directory);
-            } catch (const std::runtime_error &) {
-                handle = 0xFFFFU;
+                const auto [server_path, exist] = drive.create_server_path(search_template);
+                handle = drive.get_handle(server_path.parent_path());
+            } catch (const std::runtime_error & ex) {
+                return_code = log_exception_get_dos_err_code(
+                    "FIND_FIRST", reqdrv, search_template_parent.string(), DOS_EXTERR_NO_MORE_FILES, ex);
+                break;
             }
             DosFileProperties properties;
             uint16_t fpos = 0;
             if ((handle == 0xFFFFU) || !drive.find_file(handle, filemaskfcb, fattr, properties, fpos)) {
+                return_code = DOS_EXTERR_NO_MORE_FILES;
                 log(LogLevel::INFO,
-                    "FIND_FIRST No matching file found in \"{:c}:\\{}\"\n filemask: \"{}\"\n attrs: 0x{:2X}\n",
+                    "FIND_FIRST: ({}) No matching file found in \"{:c}:\\{}\" filemask: \"{}\" attrs: 0x{:2X}\n",
+                    return_code,
                     reqdrv + 'A',
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                    utf8_to_sjis(search_template_parent.string()),
+#else
                     search_template_parent.string(),
+#endif
                     filemask,
                     fattr);
 
-                // do not use DOS_EXTERR_FILE_NOT_FOUND, some applications rely on a failing FIND_FIRST
-                // to return DOS_EXTERR_NO_MORE_FILES (e.g. LapLink 5)
-                *ax = to_little16(DOS_EXTERR_NO_MORE_FILES);
             } else {
                 log(LogLevel::DEBUG,
                     "FIND_FIRST Found file: FCB \"{}\", attrs 0x{:02X}\n",
@@ -576,7 +682,7 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
                 DosFileProperties properties;
                 if (!drive.find_file(handle, *fcbmask, fattr, properties, fpos)) {
                     log(LogLevel::DEBUG, "No more matching files found\n");
-                    *ax = to_little16(DOS_EXTERR_NO_MORE_FILES);
+                    return_code = DOS_EXTERR_NO_MORE_FILES;
                 } else {
                     log(LogLevel::DEBUG,
                         "Found file: FCB \"{}\", attrs 0x{:02X}\n",
@@ -593,13 +699,14 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
                     reply_packet_len = sizeof(drive_proto_find_reply);
                 }
             } catch (const std::runtime_error & ex) {
+                return_code = DOS_EXTERR_NO_MORE_FILES;
                 log(LogLevel::WARNING,
-                    "FIND_NEXT failed looking for {} file in dir handle {}\n fcbmask: \"{}\"\n attrs: 0x{:2X}\n",
+                    "FIND_NEXT: ({}) Failed looking for {} file in dir handle {} fcbmask: \"{}\" attrs: 0x{:2X}\n",
+                    return_code,
                     fpos,
                     handle,
                     fcb_file_name_to_cstr(*fcbmask),
                     fattr);
-                *ax = to_little16(DOS_EXTERR_NO_MORE_FILES);
             }
         } break;
 
@@ -625,8 +732,8 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
                 fsize = -1;
             }
             if (fsize < 0) {
-                log(LogLevel::WARNING, "SEEK_FROM_END file not found or other error\n");
-                *ax = to_little16(DOS_EXTERR_FILE_NOT_FOUND);
+                return_code = DOS_EXTERR_FILE_NOT_FOUND;
+                log(LogLevel::WARNING, "SEEK_FROM_END: ({}) Handle not found or other error\n", return_code);
             } else {
                 // compute new offset and send it back
                 offset += fsize;
@@ -658,24 +765,32 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
             const uint16_t action_code = from_little16(request->action);
             const uint16_t ext_open_create_open_mode = from_little16(request->mode);
 
+            const auto relative_path = create_relative_path(request_data + 6, request_data_len - 6);
             try {
-                const auto relative_path = create_relative_path(request_data + 6, request_data_len - 6);
                 const auto [server_path, exist] = drive.create_server_path(relative_path);
                 const auto server_directory = server_path.parent_path();
 
                 log(LogLevel::DEBUG,
                     "OPEN/CREATE/EXTENDED_OPEN_CREATE \"{:c}:\\{}\", stack_attr=0x{:04X}\n",
                     reqdrv + 'A',
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                    utf8_to_sjis(relative_path.string()),
+#else
                     relative_path.string(),
+#endif
                     stack_attr);
                 std::error_code ec;
                 if (!std::filesystem::is_directory(server_directory)) {
+                    return_code = DOS_EXTERR_PATH_NOT_FOUND;
                     log(LogLevel::WARNING,
-                        "OPEN/CREATE/EXTENDED_OPEN_CREATE: Directory \"{}\" does not exist\n",
+                        "OPEN/CREATE/EXTENDED_OPEN_CREATE: ({}) Parent path is not a directory: \"{}\"\n",
+                        return_code,
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                        utf8_to_sjis(server_directory.string()));
+#else
                         server_directory.string());
-                    *ax = to_little16(DOS_EXTERR_PATH_NOT_FOUND);
+#endif
                 } else {
-                    bool error = false;
                     uint8_t result_open_mode;
                     uint16_t ext_open_create_result_code = 0;
                     DosFileProperties properties;
@@ -683,133 +798,136 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
                     if (function == INT2F_OPEN_FILE) {
                         log(LogLevel::DEBUG,
                             "OPEN_FILE \"{}\", stack_attr=0x{:04X}\n",
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                            utf8_to_sjis(server_path.string()),
+#else
                             server_path.string(),
+#endif
                             stack_attr);
                         result_open_mode = stack_attr & 0xFF;
-                        // check that item exists, and is neither a volume nor a directory
                         const auto attr = drive.get_server_path_dos_properties(server_path, &properties);
-                        if (attr == 0xFF || ((attr & (FAT_VOLUME | FAT_DIRECTORY)) != 0)) {
-                            error = true;
-                        }
-                        if ((result_open_mode & (OPEN_MODE_WRONLY | OPEN_MODE_RDWR)) && (attr & FAT_RO)) {
+                        if (attr == FAT_ERROR_ATTR) {
                             throw FilesystemError(
-                                std::format(
-                                    "Access denied: File \"{}\" has the READ_ONLY attribute", server_path.string()),
-                                DOS_EXTERR_ACCESS_DENIED);
+                                std::format("OPEN_FILE: Cannot get attributes for \"{}\"", server_path.string()),
+                                DOS_EXTERR_FILE_NOT_FOUND);
                         }
+                        drive.try_open_file(server_path, result_open_mode, attr);
                     } else if (function == INT2F_CREATE_FILE) {
                         log(LogLevel::DEBUG,
                             "CREATE_FILE \"{}\", stack_attr=0x{:04X}\n",
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                            utf8_to_sjis(server_path.string()),
+#else
                             server_path.string(),
+#endif
                             stack_attr);
-                        if (std::filesystem::exists(server_path) &&
-                            (drive.get_server_path_attrs(server_path) & FAT_RO)) {
-                            throw FilesystemError(
-                                std::format(
-                                    "Access denied: File \"{}\" has the READ_ONLY attribute", server_path.string()),
-                                DOS_EXTERR_ACCESS_DENIED);
+                        const bool file_exists = std::filesystem::exists(server_path);
+                        const uint8_t attr = file_exists ? drive.get_server_path_attrs(server_path) : FAT_ERROR_ATTR;
+                        properties = drive.create_or_truncate_file(server_path, stack_attr & 0xFF, attr);
+                        if (!file_exists) {
+                            // Recreates directory_list
+                            drive.create_server_path(relative_path, true);
                         }
-                        properties = drive.create_or_truncate_file(server_path, stack_attr & 0xFF);
-                        result_open_mode = 2;  // read/write
+                        result_open_mode = OPEN_MODE_RDWR;
                     } else {
                         log(LogLevel::DEBUG,
                             "EXTENDED_OPEN_CREATE_FILE \"{}\", stack_attr=0x{:04X}, action_code=0x{:04X}, "
                             "open_mode=0x{:04X}\n",
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                            utf8_to_sjis(server_path.string()),
+#else
                             server_path.string(),
+#endif
                             stack_attr,
                             action_code,
                             ext_open_create_open_mode);
 
                         const auto attr = drive.get_server_path_dos_properties(server_path, &properties);
-                        result_open_mode =
-                            ext_open_create_open_mode & 0x7f;  // etherdfs says: that's what PHANTOM.C does
-                        if (attr == FAT_ERROR_ATTR) {          // file not found
+                        result_open_mode = ext_open_create_open_mode & 0x7f;  // Why 0x7F? PHANTOM.C does it too
+                        if (attr == FAT_ERROR_ATTR) {                         // file not found
                             log(LogLevel::DEBUG, "File doesn't exist -> ");
                             if ((action_code & IF_NOT_EXIST_MASK) == ACTION_CODE_CREATE_IF_NOT_EXIST) {
                                 log(LogLevel::DEBUG, "create file\n");
-                                properties = drive.create_or_truncate_file(server_path, stack_attr & 0xFF);
+                                properties = drive.create_or_truncate_file(server_path, stack_attr & 0xFF, attr);
+                                // Recreates directory_list
+                                drive.create_server_path(relative_path, true);
                                 ext_open_create_result_code = DOS_EXT_OPEN_FILE_RESULT_CODE_CREATED;
                             } else {
-                                log(LogLevel::WARNING,
-                                    "EXTENDED_OPEN_CREATE_FILE fail: file \"{}\" does not exist\n",
-                                    server_path.string());
-                                error = true;
-                            }
-                        } else if ((attr & (FAT_VOLUME | FAT_DIRECTORY)) != 0) {
-                            log(LogLevel::WARNING,
-                                "OPEN/CREATE/EXTENDED_OPEN_CREATE Item \"{}\" is either a DIR or a VOL\n",
-                                server_path.string());
-                            error = true;
-                        } else {
-                            log(LogLevel::DEBUG, "File exists already (attr 0x{:02X}) -> ", attr);
-                            if ((result_open_mode & (OPEN_MODE_WRONLY | OPEN_MODE_RDWR)) && (attr & FAT_RO)) {
                                 throw FilesystemError(
                                     std::format(
-                                        "Access denied: File \"{}\" has the READ_ONLY attribute", server_path.string()),
-                                    DOS_EXTERR_ACCESS_DENIED);
+                                        "EXTENDED_OPEN_CREATE_FILE fail: file \"{}\" does not exist",
+                                        server_path.string()),
+                                    DOS_EXTERR_FILE_NOT_FOUND);
                             }
+                        } else {
+                            log(LogLevel::DEBUG, "Path exists already (attr 0x{:02X}) -> ", attr);
                             if ((action_code & IF_EXIST_MASK) == ACTION_CODE_OPEN_IF_EXIST) {
                                 log(LogLevel::DEBUG, "open file\n");
+                                drive.try_open_file(server_path, result_open_mode, attr);
                                 ext_open_create_result_code = DOS_EXT_OPEN_FILE_RESULT_CODE_OPENED;
                             } else if ((action_code & IF_EXIST_MASK) == ACTION_CODE_REPLACE_IF_EXIST) {
-                                log(LogLevel::DEBUG, "truncate file\n");
-                                properties = drive.create_or_truncate_file(server_path, stack_attr & 0xFF);
+                                log(LogLevel::DEBUG, "replace file\n");
+                                properties = drive.create_or_truncate_file(server_path, stack_attr & 0xFF, attr);
                                 ext_open_create_result_code = DOS_EXT_OPEN_FILE_RESULT_CODE_TRUNCATED;
                             } else {
-                                log(LogLevel::WARNING, "OPEN/CREATE/EXTENDED_OPEN_CREATE Fail, file already exists\n");
-                                error = true;
+                                throw FilesystemError(
+                                    std::format(
+                                        "EXTENDED_OPEN_CREATE_FILE fail: file \"{}\" already exists",
+                                        server_path.string()),
+                                    DOS_EXTERR_FILE_ALREADY_EXISTS);
                             }
                         }
                     }
 
-                    if (error) {
-                        log(LogLevel::WARNING,
-                            "OPEN/CREATE/EXTENDED_OPEN_CREATE failed \"{:c}:\\{}\", stack_attr=0x{:04X}\n",
-                            reqdrv + 'A',
-                            relative_path.string(),
-                            stack_attr);
-                        *ax = to_little16(DOS_EXTERR_FILE_NOT_FOUND);
-                    } else {
-                        // success (found a file, created it or truncated it)
-                        const auto handle = drive.get_handle(server_path);
-                        const auto fcb_name = short_name_to_fcb(relative_path.filename().string());
-                        log(LogLevel::DEBUG, "File \"{}\", handle {}\n", server_path.string(), handle);
-                        log(LogLevel::DEBUG, "    FCB file name: {}\n", fcb_file_name_to_cstr(fcb_name));
-                        log(LogLevel::DEBUG, "    size: {}\n", properties.size);
-                        log(LogLevel::DEBUG, "    attrs: 0x{:02X}\n", properties.attrs);
-                        log(LogLevel::DEBUG, "    date_time: {:04X}\n", properties.time_date);
-                        if (handle == 0xFFFFU) {
-                            log(LogLevel::WARNING,
-                                "OPEN/CREATE/EXTENDED_OPEN_CREATE Failed to get file handle \"{:c}:\\{}\", ({})\n",
-                                reqdrv + 'A',
-                                relative_path.string(),
-                                server_path.string());
-                            return -1;
-                        }
-                        auto * const reply = reinterpret_cast<drive_proto_open_create_reply *>(reply_data);
-                        reply->attrs = properties.attrs;
-                        reply->name = fcb_name;
-                        reply->date_time = to_little32(properties.time_date);
-                        reply->size = to_little32(properties.size);
-                        reply->start_cluster = to_little16(handle);
-                        // CX result (only relevant for EXTENDED_OPEN_CREATE)
-                        reply->result_code = to_little16(ext_open_create_result_code);
-                        reply->mode = result_open_mode;
-                        reply_packet_len = sizeof(drive_proto_open_create_reply);
+                    // success (found a file, created it or truncated it)
+                    const auto handle = drive.get_handle(server_path);
+                    const auto fcb_name = short_name_to_fcb(relative_path.filename().string());
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                    log(LogLevel::DEBUG, "File \"{}\", handle {}\n", utf8_to_sjis(server_path.string()), handle);
+#else
+                    log(LogLevel::DEBUG, "File \"{}\", handle {}\n", server_path.string(), handle);
+#endif
+                    log(LogLevel::DEBUG, "    FCB file name: {}\n", fcb_file_name_to_cstr(fcb_name));
+                    log(LogLevel::DEBUG, "    size: {}\n", properties.size);
+                    log(LogLevel::DEBUG, "    attrs: 0x{:02X}\n", properties.attrs);
+                    log(LogLevel::DEBUG, "    date_time: {:04X}\n", properties.time_date);
+                    if (handle == 0xFFFFU) {
+                        throw FilesystemError(
+                            std::format("Failed to get file handle for \"{}\"", server_path.string()),
+                            DOS_EXTERR_TOO_MANY_OPEN_FILES);
                     }
+                    auto * const reply = reinterpret_cast<drive_proto_open_create_reply *>(reply_data);
+                    reply->attrs = properties.attrs;
+                    reply->name = fcb_name;
+                    reply->date_time = to_little32(properties.time_date);
+                    reply->size = to_little32(properties.size);
+                    reply->start_cluster = to_little16(handle);
+                    // CX result (only relevant for EXTENDED_OPEN_CREATE)
+                    reply->result_code = to_little16(ext_open_create_result_code);
+                    reply->mode = result_open_mode;
+                    reply_packet_len = sizeof(drive_proto_open_create_reply);
                 }
-            } catch (const FilesystemError & ex) {
-                log(LogLevel::WARNING, "OPEN/CREATE/EXTENDED_OPEN_CREATE: {}\n", ex.what());
-                *ax = to_little16(ex.get_dos_err_code());
             } catch (const std::runtime_error & ex) {
-                log(LogLevel::WARNING, "OPEN/CREATE/EXTENDED_OPEN_CREATE: {}\n", ex.what());
-                *ax = to_little16(DOS_EXTERR_FILE_NOT_FOUND);
+                return_code = get_dos_err_code(ex, DOS_EXTERR_FILE_NOT_FOUND);
+                log(LogLevel::WARNING,
+                    "OPEN/CREATE/EXTENDED_OPEN_CREATE \"{:c}:\\{}\", stack_attr=0x{:04X}: ({}) {}\n",
+                    reqdrv + 'A',
+#if defined(_WIN32) && defined(SHIFT_JIS)
+                    utf8_to_sjis(relative_path.string()),
+#else
+                    relative_path.string(),
+#endif
+                    stack_attr,
+                    return_code,
+                    ex.what());
             }
         } break;
 
         default:  // unknown query - ignore
             return -1;
     }
+
+    reply_header->ax = to_little16(return_code);
 
     return reply_packet_len + sizeof(struct drive_proto_hdr);
 }
@@ -887,7 +1005,7 @@ void print_help(const char * program_name) {
 
     print(
         stdout,
-        "NetMount server {}, Copyright 2025 Jaroslav Rohel <jaroslav.rohel@gmail.com>\n"
+        "NetMount server {}, Copyright 2025-2026 Jaroslav Rohel <jaroslav.rohel@gmail.com>\n"
         "NetMount server comes with ABSOLUTELY NO WARRANTY. This is free software\n"
         "and you are welcome to redistribute it under the terms of the GNU GPL v2.\n\n",
         PROGRAM_VERSION);
@@ -898,8 +1016,9 @@ void print_help(const char * program_name) {
         "{} [--help] [--bind-addr=<IP_ADDR>] [--bind-port=<UDP_PORT] "
         "[--slip-dev=<SERIAL_DEVICE> --slip-speed=<BAUD_RATE>] [--slip-rts-cts=<ENABLED>] "
         "[--translit-map-path=<PATH>] [--log-level=<LEVEL>] "
-        "<drive>=<root_path>[,attrs=<storage_method>][,label=<volume_label>][,name_conversion=<method>] "
-        "[... <drive>=<root_path>[,label=<volume_label>][,name_conversion=<method>]]\n\n",
+        "<drive>=<root_path>[,attrs=<storage_method>][,label=<volume_label>][,name_conversion=<method>]"
+        "[,readonly=<MODE>] [... <drive>=<root_path>[,label=<volume_label>][,name_conversion=<method>]"
+        "[,readonly=<MODE>]]\n\n",
         program_name);
 
     print(
@@ -918,7 +1037,8 @@ void print_help(const char * program_name) {
         "  attrs=<storage_method>      File attribute storage method: AUTO, IGNORE" NATIVE EXTENDED
         " (default: AUTO)\n"
         "  label=<volume_label>        volume label (first 11 chars used, default: {}; use \"--label=\" to remove)\n"
-        "  name_conversion=<method>    file name conversion method: OFF, RAM (default: RAM)\n",
+        "  name_conversion=<method>    file name conversion method: OFF, RAM (default: RAM)\n"
+        "  readonly=<MODE>             enable read-only sharing: 0 = writable, 1 = read-only (default: writable)\n",
         DRIVE_PROTO_UDP_PORT,
         DEFAULT_VOLUME_LABEL);
 
@@ -1073,6 +1193,24 @@ int parse_share_definition(std::string_view share) {
             print(stdout, "Unknown file name conversion method \"{}\"\n", value);
             return -1;
         }
+        if (option == "readonly") {
+            const auto value = get_token(share, ',', ++offset);
+            log(LogLevel::INFO,
+                "Set read-only mode for drive \"{:c}\" path \"{}\" to \"{}\"\n",
+                drive_char,
+                drive.get_root().string(),
+                value);
+            if (value == "0") {
+                drive.set_read_only(false);
+                continue;
+            }
+            if (value == "1") {
+                drive.set_read_only(true);
+                continue;
+            }
+            print(stdout, "Unknown read-only mode \"{}\"\n", value);
+            return -1;
+        }
         print(stdout, "Unknown argument \"{}\"\n", option);
         return -1;
     }
@@ -1099,7 +1237,7 @@ int main(int argc, char ** argv) {
     uint32_t slip_speed{0};
     bool slip_hw_flow_control{false};
     unsigned char cksumflag;
-    std::filesystem::path transliteration_map_path = TRANSLITERATION_MAP_FILE;
+    std::filesystem::path transliteration_map_path = "";
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg(argv[i]);
@@ -1165,9 +1303,14 @@ int main(int argc, char ** argv) {
             global_log_level = static_cast<LogLevel>(log_level);
             continue;
         }
-        if (arg.starts_with("--translit-map-path=")) {
-            transliteration_map_path = arg.substr(20);
-            continue;
+        if (arg.starts_with("--translit-map-path")) {
+            if (arg.length() == 19) {
+                transliteration_map_path = TRANSLITERATION_MAP_FILE;
+                continue;
+            } else if (arg[19] == '=') {
+                transliteration_map_path = arg.substr(20);
+                continue;
+            }
         }
         if (arg[1] == '=') {
             auto ret = parse_share_definition(arg);
@@ -1267,26 +1410,26 @@ int main(int argc, char ** argv) {
         }
 
         if (print_header) {
-            print(stdout, "attrs mode | drive | path\n");
+            print(stdout, "attrs mode |   access   | drive | path\n");
             print_header = false;
         }
 
         is_file_name_conversion_active |= drive.get_file_name_conversion() != Drive::FileNameConversion::OFF;
 
         const auto attrs_mode = drive.get_attrs_mode();
+        const auto read_only = drive.is_read_only();
         print(
             stdout,
-            "{:^11}|   {:c}   | {}\n",
+            "{:^11}|{:^12}|   {:c}   | {}\n",
             attrs_mode == AttrsMode::IN_EXTENDED ? "extended" : (attrs_mode == AttrsMode::NATIVE ? "native" : "ignore"),
+            read_only ? "read-only" : "read/write",
             'A' + i,
             drive.get_root().string());
     }
 
     if (is_file_name_conversion_active && !transliteration_map_path.empty()) {
         try {
-#ifndef SHIFT_JIS
             load_transliteration_map(transliteration_map_path);
-#endif
         } catch (const std::exception & ex) {
             log(LogLevel::CRITICAL,
                 "Filename conversion is enabled, but the transliteration map failed to load: {}\n",
@@ -1370,9 +1513,9 @@ int main(int argc, char ** argv) {
                 continue;
             }
 
-            cksumflag = from_little16(header->length_flags) >> 15;
+            cksumflag = from_little16(header->length_flags) >> FLAGS_CHECKSUM_BIT;
 
-            const uint16_t length_from_header = from_little16(header->length_flags) & 0x7FF;
+            const uint16_t length_from_header = from_little16(header->length_flags) & LENGTH_MASK;
             if (length_from_header < sizeof(struct drive_proto_hdr)) {
                 log(LogLevel::ERROR, "received a malformed packet from {}:{}\n", last_remote_ip_str, last_remote_port);
                 continue;
@@ -1457,17 +1600,29 @@ int main(int argc, char ** argv) {
                 // fill in header
                 auto * const header = reinterpret_cast<struct drive_proto_hdr *>(reply_info.send_packet.data());
                 header->length_flags = to_little16(send_msg_len);
+
+                {
+                    auto * const rcv_header =
+                        reinterpret_cast<struct drive_proto_hdr const *>(reply_info.recv_packet.data());
+                    const unsigned int reqdrv = rcv_header->drive & 0x1F;
+                    if (drives[reqdrv].is_read_only()) {
+                        // Set the information flag: share is read-only
+                        header->length_flags |= to_little16(FLAGS_READONLY);
+                    }
+                }
+
                 if (cksumflag != 0) {
                     const uint16_t checksum = bsd_checksum(
                         &header->checksum + 1,
                         send_msg_len -
                             (reinterpret_cast<uint8_t *>(&header->checksum + 1) - reinterpret_cast<uint8_t *>(header)));
                     header->checksum = to_little16(checksum);
-                    header->length_flags |= to_little16(0x8000);  // set the checksum flag
+                    header->length_flags |= to_little16(FLAGS_CHECKSUM);  // set the checksum flag
                 } else {
                     header->checksum = to_little16(DRIVE_PROTO_MAGIC);
-                    header->length_flags &= to_little16(0x7FFF);  // zero the checksum flag
+                    header->length_flags &= to_little16(FLAGS_CHECKSUM_OFF);  // zero the checksum flag
                 }
+                header->length_flags |= to_little16(FLAGS_DATETIME);
 
                 log(LogLevel::DEBUG, "Sending back an answer of {} bytes\n", send_msg_len);
                 if (global_log_level >= LogLevel::TRACE) {

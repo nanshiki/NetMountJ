@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Copyright 2025 Jaroslav Rohel, jaroslav.rohel@gmail.com
+// Copyright 2025-2026 Jaroslav Rohel, jaroslav.rohel@gmail.com
 
 #ifndef _FS_HPP_
 #define _FS_HPP_
@@ -79,6 +79,9 @@ public:
     // Returns root path of shared drive.
     const std::filesystem::path & get_root() const noexcept { return root; }
 
+    bool is_read_only() const noexcept { return read_only; }
+    void set_read_only(bool read_only) noexcept { this->read_only = read_only; }
+
     void set_attrs_mode(AttrsMode mode) { attrs_mode = mode; }
 
     AttrsMode get_attrs_mode() const noexcept { return attrs_mode; }
@@ -116,6 +119,8 @@ public:
 
     /// Returns the size of file defined by handle (or -1 on error)
     int32_t get_file_size(uint16_t handle);
+
+    void set_file_date_time(uint16_t handle, uint32_t date_time);
 
     /// Searches for files matching template `tmpl` in directory defined by `handle`
     /// with at most attributes `attr`.
@@ -169,7 +174,10 @@ public:
     /// Creates or truncates a file `server_path` with attributes `attrs`.
     /// Returns properties of created/truncated file.
     /// Throws exception on error.
-    DosFileProperties create_or_truncate_file(const std::filesystem::path & server_path, uint8_t attrs);
+    DosFileProperties create_or_truncate_file(const std::filesystem::path & server_path, uint8_t requested_attrs, uint8_t current_attrs);
+
+    /// Try to open a file, then close it.
+    void try_open_file(const std::filesystem::path & server_path, uint8_t open_mode, uint8_t current_attrs);
 
     /// Returns filesystem total size and free space in bytes, or 0, 0 on error
     std::pair<uint64_t, uint64_t> space_info();
@@ -179,6 +187,7 @@ private:
 
     bool used{false};
     std::filesystem::path root;
+    bool read_only{false};
     fcb_file_name volume_label;
     bool has_volume_label{false};
     AttrsMode attrs_mode{AttrsMode::AUTO};

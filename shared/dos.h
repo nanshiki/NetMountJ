@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Copyright 2024 Jaroslav Rohel, jaroslav.rohel@gmail.com
+// Copyright 2024-2026 Jaroslav Rohel, jaroslav.rohel@gmail.com
 
 #ifndef _DOS_H_
 #define _DOS_H_
@@ -103,6 +103,8 @@
 #define DOS_EXTERR_NO_SPACE_TO_PRINT_FILE      63  // not enough space to print file
 #define DOS_EXTERR_NET_NAME_WAS_DELETED        64  // network name was deleted
 
+#define DOS_EXTERR_FILE_ALREADY_EXISTS 80  // File (directory) already exists
+
 // structs are paked
 #pragma pack(push, 1)
 
@@ -139,9 +141,9 @@ struct dos_current_dir {
     };
     uint16_t backslash_offset;  // offset in current_path of first '\' (always 2, unless it's a SUBST drive)
 #ifndef DOS3
-    uint8_t reserved;           //unknown
-    far_pointer(void) ifs;      // points to IFS (Installable File System) driver
-    uint16_t reserved2;         // unknown
+    uint8_t reserved;       //unknown
+    far_pointer(void) ifs;  // points to IFS (Installable File System) driver
+    uint16_t reserved2;     // unknown
 #endif
 };
 
@@ -241,8 +243,13 @@ struct dos_sft {
     uint32_t file_time;      // file date and time
     uint32_t file_size;      // file length
     uint32_t file_pos;       // current file position
-    uint16_t rel_sector;
-    uint16_t abs_sector;
+    union {
+        struct {
+            uint16_t rel_sector;
+            uint16_t abs_sector;
+        };
+        uint32_t start_file_time;
+    };
     uint16_t dir_sector;
     uint8_t dir_entry_no;  // if local, number of directory entry within sector
     struct fcb_file_name file_name;
