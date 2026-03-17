@@ -11,7 +11,7 @@
 
 #include <stdint.h>
 
-#define NETMOUNT_VERSION "1.7.1J"
+#define NETMOUNT_VERSION "1.8.0J"
 
 #ifdef PC98
 #define TICK_ADDRESS 0x4F1
@@ -727,6 +727,10 @@ static uint16_t send_request(
     const uint16_t len = request_data_len + sizeof(*snd_drive_proto);  // drive_proto_hdr and data length
     snd_drive_proto->version = DRIVE_PROTO_VERSION;
     snd_drive_proto->length_flags = len;
+    // For compatibility with the original netmount
+    if (function == INT2F_CLOSE_FILE && request_data_len == sizeof(struct drive_proto_closef)) {
+        snd_drive_proto->length_flags |= FLAGS_DATETIME;
+    }
     snd_drive_proto->sequence = sequence_num;  // sequence number
     snd_drive_proto->drive = drive;
     snd_drive_proto->function = function;  // AL value (function)
@@ -1233,7 +1237,7 @@ static void handle_request_for_our_drive(void) {
             // CX = bytes per sector
             // DX = number of available clusters
 
-            if (send_request(subfunction, reqdrv, 0, &reply, &ax) == 6) {
+            if (send_request(subfunction, reqdrv, 0, &reply, &ax) == sizeof(struct drive_proto_disk_info_reply)) {
                 r->w.ax = ax;  // AL -  sectors per cluster, AH - media ID byte
                 struct drive_proto_disk_info_reply const * const args =
                     (struct drive_proto_disk_info_reply const * const)reply;
@@ -1295,7 +1299,7 @@ static void handle_request_for_our_drive(void) {
             }
 
             i = send_request(subfunction, reqdrv, len, &reply, &ax);
-            if ((uint16_t)i == 0xFFFFU) {
+            if (i == NETWORK_ERROR) {
                 set_error(r, DOS_EXTERR_FILE_NOT_FOUND);
             } else if (i != sizeof(struct drive_proto_get_attrs_reply) || ax != 0) {
                 set_error(r, ax);
@@ -2477,11 +2481,11 @@ static void print_help(void) {
         "NetMount " NETMOUNT_VERSION
         ", Copyright 2024-2026 Jaroslav Rohel <jaroslav.rohel@gmail.com>\r\n"
 #ifdef PC98
- #ifdef DOS3
+#ifdef DOS3
         "         for PC-9801 MS-DOS 3.1/3.3\r\n"
- #else
+#else
         "         for PC-9801/PC-9821 MS-DOS 5.0/6.2\r\n"
- #endif
+#endif
 #endif
         "NetMount comes with ABSOLUTELY NO WARRANTY. This is free software\r\n"
         "and you are welcome to redistribute it under the terms of the GNU GPL v2.\r\n"

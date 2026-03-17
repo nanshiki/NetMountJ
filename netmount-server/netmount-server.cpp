@@ -25,9 +25,9 @@
 #include <string_view>
 
 #ifdef SHIFT_JIS
-#define PROGRAM_VERSION "1.7.0J"
+#define PROGRAM_VERSION "1.8.0J"
 #else
-#define PROGRAM_VERSION "1.7.0"
+#define PROGRAM_VERSION "1.8.0"
 #endif
 
 // structs are packed
@@ -183,6 +183,7 @@ uint16_t log_exception_get_dos_err_code(
     const std::runtime_error & ex) {
 
     default_dos_err_code = get_dos_err_code(ex, default_dos_err_code);
+
     log(LogLevel::WARNING,
         "{} \"{:c}:\\{}\": ({}) {}\n",
         function,
@@ -238,11 +239,15 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
         reply_info.recv_len == request_packet_len &&
         memcmp(reply_info.recv_packet.data(), request_packet, request_packet_len) == 0) {
         if (reply_info.send_len > 0) {
-            log(LogLevel::NOTICE, "Using a packet from the reply cache (seq {:d})\n", reply_header->sequence);
+            log(LogLevel::NOTICE,
+                "{}: Using a packet from the reply cache (seq {:d})\n",
+                __func__,
+                reply_header->sequence);
             return reply_info.send_len;
         } else {
             log(LogLevel::NOTICE,
-                "Request with seq {:d} found in reply cache, but no response exists. Ignoring.\n",
+                "{}: Request with seq {:d} found in reply cache, but no response exists. Ignoring.\n",
+                __func__,
                 request_header->sequence);
             return -1;
         }
@@ -259,14 +264,18 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
     int reply_packet_len = 0;
 
     if ((reqdrv < 2) || (reqdrv >= drives.size())) {
-        log(LogLevel::ERROR, "Requested invalid drive number: {:d}\n", reqdrv);
+        log(LogLevel::WARNING, "{}: Requested invalid drive number: {:d}\n", __func__, reqdrv);
         return -1;
     }
 
     // Do I share this drive?
     auto & drive = drives[reqdrv];
     if (!drive.is_shared()) {
-        log(LogLevel::WARNING, "Requested drive is not shared: {:c}: (number {:d})\n", 'A' + reqdrv, reqdrv);
+        log(LogLevel::WARNING,
+            "{}: Requested drive is not shared: {:c}: (number {:d})\n",
+            __func__,
+            'A' + reqdrv,
+            reqdrv);
         return -1;
     }
 
@@ -292,7 +301,10 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
             try {
                 if (function == INT2F_MAKE_DIR) {
 #if defined(_WIN32) && defined(SHIFT_JIS)
-                    log(LogLevel::DEBUG, "MAKE_DIR \"{:c}:\\{}\"\n", reqdrv + 'A', utf8_to_sjis(relative_path.string()));
+                    log(LogLevel::DEBUG,
+                        "MAKE_DIR \"{:c}:\\{}\"\n",
+                        reqdrv + 'A',
+                        utf8_to_sjis(relative_path.string()));
 #else
                     log(LogLevel::DEBUG, "MAKE_DIR \"{:c}:\\{}\"\n", reqdrv + 'A', relative_path.string());
 #endif
@@ -446,23 +458,76 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
             log(LogLevel::DEBUG, "DISK_INFO for drive {:c}:\n", 'A' + reqdrv);
             try {
                 auto [fs_size, free_space] = drive.space_info();
-                // limit results to slightly under 2 GiB (otherwise MS-DOS is confused)
-                if (fs_size >= 2lu * 1024 * 1024 * 1024)
-                    fs_size = 2lu * 1024 * 1024 * 1024 - 1;
-                if (free_space >= 2lu * 1024 * 1024 * 1024)
-                    free_space = 2lu * 1024 * 1024 * 1024 - 1;
+
+                // limit results to slightly less than 2 GiB (otherwise MS-DOS is confused)
+                if (fs_size > 0x7FFFFFFFUL)
+                    fs_size = 0x7FFFFFFFUL;
+                if (free_space > 0x7FFFFFFFUL)
+                    free_space = 0x7FFFFFFFUL;
+
+
+                // Use sector size 512 bytes
+                uint16_t bytes_per_sector = 512;
+                uint32_t total_sectors = fs_size / bytes_per_sector;
+                uint32_t free_sectors = free_space / bytes_per_sector;
+
+                // Increase sector size until total sectors fit in 16-bit integer
+                while (total_sectors > 0xFFFFUL) {
+                    bytes_per_sector *= 2;
+                    total_sectors /= 2;
+                    free_sectors /= 2;
+                }
+
                 log(LogLevel::DEBUG, "  TOTAL: {} KiB ; FREE: {} KiB\n", fs_size >> 10, free_space >> 10);
                 // AX: media id (8 bits) | sectors per cluster (8 bits)
                 // etherdfs says: MSDOS tolerates only 1 here!
                 return_code = 1;
                 auto * const reply = reinterpret_cast<drive_proto_disk_info_reply *>(reply_data);
-                reply->total_clusters = to_little16(fs_size >> 15);  // 32K clusters
-                reply->bytes_per_sector = to_little16(32768);
-                reply->available_clusters = to_little16(free_space >> 15);  // 32K clusters
+                reply->total_clusters = to_little16(total_sectors);
+                reply->bytes_per_sector = to_little16(bytes_per_sector);
+                reply->available_clusters = to_little16(free_sectors);
                 reply_packet_len = sizeof(drive_proto_disk_info_reply);
             } catch (const std::runtime_error & ex) {
                 return_code = DOS_EXTERR_ACCESS_DENIED;
                 log(LogLevel::WARNING, "DISK_INFO drive {:c}: ({}) {}\n", reqdrv + 'A', return_code, ex.what());
+            }
+        } break;
+
+        case INT2F_DISK_INFO_LARGE: {
+            if (request_data_len != 0) {
+                return -1;
+            }
+            log(LogLevel::DEBUG, "DISK_INFO_LARGE for drive {:c}:\n", 'A' + reqdrv);
+            try {
+                auto [fs_size, free_space] = drive.space_info();
+
+                // limit results to slightly less than 256 TiB
+                if (fs_size > 0xFFFFFFFFUL * 0xFFFFU)
+                    fs_size = 0xFFFFFFFFUL * 0xFFFFU;
+                if (free_space > 0xFFFFFFFFUL * 0xFFFFU)
+                    free_space = 0xFFFFFFFFUL * 0xFFFFU;
+
+                // Use sector size 512 bytes
+                uint16_t bytes_per_sector = 512;
+                uint64_t total_sectors = fs_size / bytes_per_sector;
+                uint64_t free_sectors = free_space / bytes_per_sector;
+
+                // Increase sector size until total sectors fit in 32-bit integer
+                while (total_sectors > 0xFFFFFFFFUL) {
+                    bytes_per_sector *= 2;
+                    total_sectors /= 2;
+                    free_sectors /= 2;
+                }
+
+                log(LogLevel::DEBUG, "  TOTAL: {} KiB ; FREE: {} KiB\n", fs_size >> 10, free_space >> 10);
+                auto * const reply = reinterpret_cast<drive_proto_disk_info_large_reply *>(reply_data);
+                reply->total_clusters = to_little32(total_sectors);
+                reply->bytes_per_sector = to_little16(bytes_per_sector);
+                reply->available_clusters = to_little32(free_sectors);
+                reply_packet_len = sizeof(drive_proto_disk_info_large_reply);
+            } catch (const std::runtime_error & ex) {
+                return_code = DOS_EXTERR_ACCESS_DENIED;
+                log(LogLevel::WARNING, "DISK_INFO_LARGE drive {:c}: ({}) {}\n", reqdrv + 'A', return_code, ex.what());
             }
         } break;
 
@@ -681,11 +746,11 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
             try {
                 DosFileProperties properties;
                 if (!drive.find_file(handle, *fcbmask, fattr, properties, fpos)) {
-                    log(LogLevel::DEBUG, "No more matching files found\n");
+                    log(LogLevel::DEBUG, "FIND_NEXT No more matching files found\n");
                     return_code = DOS_EXTERR_NO_MORE_FILES;
                 } else {
                     log(LogLevel::DEBUG,
-                        "Found file: FCB \"{}\", attrs 0x{:02X}\n",
+                        "FIND_NEXT Found file: FCB \"{}\", attrs 0x{:02X}\n",
                         fcb_file_name_to_cstr(properties.fcb_name),
                         properties.attrs);
                     auto * const reply = reinterpret_cast<drive_proto_find_reply *>(reply_data);
@@ -782,7 +847,7 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
                 std::error_code ec;
                 if (!std::filesystem::is_directory(server_directory)) {
                     return_code = DOS_EXTERR_PATH_NOT_FOUND;
-                    log(LogLevel::WARNING,
+                    log(LogLevel::INFO,
                         "OPEN/CREATE/EXTENDED_OPEN_CREATE: ({}) Parent path is not a directory: \"{}\"\n",
                         return_code,
 #if defined(_WIN32) && defined(SHIFT_JIS)
@@ -845,7 +910,7 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
                         const auto attr = drive.get_server_path_dos_properties(server_path, &properties);
                         result_open_mode = ext_open_create_open_mode & 0x7f;  // Why 0x7F? PHANTOM.C does it too
                         if (attr == FAT_ERROR_ATTR) {                         // file not found
-                            log(LogLevel::DEBUG, "File doesn't exist -> ");
+                            log(LogLevel::DEBUG, "EXTENDED_OPEN_CREATE_FILE File doesn't exist -> ");
                             if ((action_code & IF_NOT_EXIST_MASK) == ACTION_CODE_CREATE_IF_NOT_EXIST) {
                                 log(LogLevel::DEBUG, "create file\n");
                                 properties = drive.create_or_truncate_file(server_path, stack_attr & 0xFF, attr);
@@ -860,7 +925,9 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
                                     DOS_EXTERR_FILE_NOT_FOUND);
                             }
                         } else {
-                            log(LogLevel::DEBUG, "Path exists already (attr 0x{:02X}) -> ", attr);
+                            log(LogLevel::DEBUG,
+                                "EXTENDED_OPEN_CREATE_FILE Path exists already (attr 0x{:02X}) -> ",
+                                attr);
                             if ((action_code & IF_EXIST_MASK) == ACTION_CODE_OPEN_IF_EXIST) {
                                 log(LogLevel::DEBUG, "open file\n");
                                 drive.try_open_file(server_path, result_open_mode, attr);
@@ -923,6 +990,15 @@ int process_request(ReplyCache::ReplyInfo & reply_info, const uint8_t * request_
             }
         } break;
 
+        case INT2F_NETMOUNT_FEATURE_QUERY: {
+            if (request_data_len != sizeof(drive_proto_netmount_feature)) {
+                return -1;
+            }
+
+            // Always returns 0; this server does not implement additional features.
+            return_code = 0;
+        } break;
+
         default:  // unknown query - ignore
             return -1;
     }
@@ -974,6 +1050,8 @@ void dump_packet(const unsigned char * frame, int len) {
 
         print(stderr, "\n");
     }
+
+    std::fflush(stderr);
 }
 
 
@@ -1168,7 +1246,7 @@ int parse_share_definition(std::string_view share) {
         if (option == "label") {
             const auto value = get_token(share, ',', ++offset);
             if (!value.empty()) {
-                log(LogLevel::INFO, "Set volume label to \"{}\" for drive {:c}\n", value, drive_char);
+                log(LogLevel::NOTICE, "Set volume label to \"{}\" for drive {:c}\n", value, drive_char);
                 drive.set_volume_label(value);
             }
             is_volume_label_defined = true;
@@ -1177,7 +1255,7 @@ int parse_share_definition(std::string_view share) {
         if (option == "name_conversion") {
             const auto value = get_token(share, ',', ++offset);
             auto upper_value = string_ascii_to_upper(value);
-            log(LogLevel::INFO,
+            log(LogLevel::NOTICE,
                 "Set filename conversion method for drive \"{:c}\" path \"{}\" to \"{}\"\n",
                 drive_char,
                 drive.get_root().string(),
@@ -1195,7 +1273,7 @@ int parse_share_definition(std::string_view share) {
         }
         if (option == "readonly") {
             const auto value = get_token(share, ',', ++offset);
-            log(LogLevel::INFO,
+            log(LogLevel::NOTICE,
                 "Set read-only mode for drive \"{:c}\" path \"{}\" to \"{}\"\n",
                 drive_char,
                 drive.get_root().string(),
@@ -1216,7 +1294,7 @@ int parse_share_definition(std::string_view share) {
     }
 
     if (!is_volume_label_defined) {
-        log(LogLevel::INFO, "Using default volume label \"{}\" for drive {:c}\n", DEFAULT_VOLUME_LABEL, drive_char);
+        log(LogLevel::NOTICE, "Using default volume label \"{}\" for drive {:c}\n", DEFAULT_VOLUME_LABEL, drive_char);
         drive.set_volume_label(DEFAULT_VOLUME_LABEL);
     }
 
@@ -1236,7 +1314,6 @@ int main(int argc, char ** argv) {
     std::string slip_dev;
     uint32_t slip_speed{0};
     bool slip_hw_flow_control{false};
-    unsigned char cksumflag;
     std::filesystem::path transliteration_map_path = "";
 
     for (int i = 1; i < argc; ++i) {
@@ -1426,6 +1503,7 @@ int main(int argc, char ** argv) {
             'A' + i,
             drive.get_root().string());
     }
+    std::fflush(stdout);
 
     if (is_file_name_conversion_active && !transliteration_map_path.empty()) {
         try {
@@ -1473,7 +1551,7 @@ int main(int argc, char ** argv) {
                 }
                 if (slip->get_last_dst_port() != bind_port) {
                     // Not our UDP port. Ignore packet and continue.
-                    log(LogLevel::NOTICE,
+                    log(LogLevel::INFO,
                         "slip->receive(): Ignoring received UDP packet on port {}, listening on {}\n",
                         slip->get_last_dst_port(),
                         bind_port);
@@ -1494,7 +1572,7 @@ int main(int argc, char ** argv) {
                     last_remote_port);
 
                 if (request_packet_len < static_cast<int>(sizeof(struct drive_proto_hdr))) {
-                    log(LogLevel::ERROR,
+                    log(LogLevel::WARNING,
                         "received a truncated/malformed packet from {}:{}\n",
                         last_remote_ip_str,
                         last_remote_port);
@@ -1505,7 +1583,7 @@ int main(int argc, char ** argv) {
             // check the protocol version
             auto * const header = reinterpret_cast<const drive_proto_hdr *>(request_packet);
             if (header->version != DRIVE_PROTO_VERSION) {
-                log(LogLevel::ERROR,
+                log(LogLevel::WARNING,
                     "unsupported protocol version {:d} from {}:{}\n",
                     header->version,
                     last_remote_ip_str,
@@ -1513,16 +1591,22 @@ int main(int argc, char ** argv) {
                 continue;
             }
 
-            cksumflag = from_little16(header->length_flags) >> FLAGS_CHECKSUM_BIT;
+            const bool checksum_present = from_little16(header->length_flags) & FLAGS_CHECKSUM;
 
             const uint16_t length_from_header = from_little16(header->length_flags) & LENGTH_MASK;
             if (length_from_header < sizeof(struct drive_proto_hdr)) {
-                log(LogLevel::ERROR, "received a malformed packet from {}:{}\n", last_remote_ip_str, last_remote_port);
+                log(LogLevel::WARNING,
+                    "received a malformed packet from {}:{}\n",
+                    last_remote_ip_str,
+                    last_remote_port);
                 continue;
             }
             if (length_from_header > request_packet_len) {
                 // corupted/truncated packet
-                log(LogLevel::ERROR, "received a truncated packet from {}:{}\n", last_remote_ip_str, last_remote_port);
+                log(LogLevel::WARNING,
+                    "received a truncated packet from {}:{}\n",
+                    last_remote_ip_str,
+                    last_remote_port);
                 continue;
             } else {
                 if (request_packet_len != length_from_header) {
@@ -1541,7 +1625,7 @@ int main(int argc, char ** argv) {
             log(LogLevel::DEBUG,
                 "Received packet of {} bytes (cksum = {})\n",
                 request_packet_len,
-                (cksumflag != 0) ? "ENABLED" : "DISABLED");
+                (checksum_present) ? "ENABLED" : "DISABLED");
             if (global_log_level >= LogLevel::TRACE) {
                 dump_packet(request_packet, request_packet_len);
             }
@@ -1549,20 +1633,20 @@ int main(int argc, char ** argv) {
 #ifdef SIMULATE_PACKET_LOSS
             // simulated random input packet LOSS
             if ((rand() & 31) == 0) {
-                log(LogLevel::ERROR, "Simulate incoming packet loss!\n");
+                log(LogLevel::WARNING, "Simulate incoming packet loss!\n");
                 continue;
             }
 #endif
 
             // check the checksum, if any
-            if (cksumflag != 0) {
+            if (checksum_present) {
                 const uint16_t cksum_mine = bsd_checksum(
                     &header->checksum + 1,
                     request_packet_len - (reinterpret_cast<const uint8_t *>(&header->checksum + 1) -
                                           reinterpret_cast<const uint8_t *>(header)));
                 const uint16_t cksum_remote = from_little16(header->checksum);
                 if (cksum_mine != cksum_remote) {
-                    log(LogLevel::ERROR,
+                    log(LogLevel::WARNING,
                         "CHECKSUM MISMATCH! Computed: 0x{:04X} Received: 0x{:04X}\n",
                         cksum_mine,
                         cksum_remote);
@@ -1571,7 +1655,7 @@ int main(int argc, char ** argv) {
             } else {
                 const uint16_t recv_magic = from_little16(header->checksum);
                 if (recv_magic != DRIVE_PROTO_MAGIC) {
-                    log(LogLevel::ERROR,
+                    log(LogLevel::WARNING,
                         "Bad MAGIC! Expected: 0x{:04X} Received: 0x{:04X}\n",
                         DRIVE_PROTO_MAGIC,
                         recv_magic);
@@ -1591,7 +1675,7 @@ int main(int argc, char ** argv) {
 #ifdef SIMULATE_PACKET_LOSS
             // simulated random ouput packet LOSS
             if ((rand() & 31) == 0) {
-                log(LogLevel::ERROR, "Simulate outgoing packet loss!\n");
+                log(LogLevel::WARNING, "Simulate outgoing packet loss!\n");
                 continue;
             }
 #endif
@@ -1611,7 +1695,7 @@ int main(int argc, char ** argv) {
                     }
                 }
 
-                if (cksumflag != 0) {
+                if (checksum_present) {
                     const uint16_t checksum = bsd_checksum(
                         &header->checksum + 1,
                         send_msg_len -

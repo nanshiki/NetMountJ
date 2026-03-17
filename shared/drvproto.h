@@ -15,17 +15,16 @@
 #define DRIVE_PROTO_MAGIC    0x9524U
 #define DRIVE_PROTO_UDP_PORT 12200
 
-#define FLAGS_CHECKSUM_BIT   15
-#define FLAGS_CHECKSUM       0x8000U
-#define FLAGS_CHECKSUM_OFF   0x7FFFU
-#define FLAGS_READONLY       0x4000U
-#define FLAGS_DATETIME       0x1000U
-#define LENGTH_MASK          0x07FFU
+#define FLAGS_CHECKSUM     0x8000U
+#define FLAGS_CHECKSUM_OFF 0x7FFFU
+#define FLAGS_READONLY     0x4000U
+#define FLAGS_DATETIME     0x2000U
+#define LENGTH_MASK        0x07FFU
 
 // little endian
 struct drive_proto_hdr {
     uint8_t version;
-    uint16_t length_flags;  // chechsum_used | read-only share | unused | unused | unused | length
+    uint16_t length_flags;  // chechsum_used | read-only share | datetime | unused | unused | length
     uint16_t checksum;
     uint8_t sequence;
     union {
@@ -75,6 +74,13 @@ struct drive_proto_disk_info_reply {
     uint16_t total_clusters;
     uint16_t bytes_per_sector;
     uint16_t available_clusters;
+};
+
+
+struct drive_proto_disk_info_large_reply {
+    uint32_t total_clusters;
+    uint16_t bytes_per_sector;
+    uint32_t available_clusters;
 };
 
 
@@ -146,6 +152,11 @@ struct drive_proto_seek_from_end {
 struct drive_proto_seek_from_end_reply {
     uint16_t position_lo;
     uint16_t position_hi;
+};
+
+
+struct drive_proto_netmount_feature {
+    uint16_t feature_id;
 };
 
 #pragma pack(pop)
